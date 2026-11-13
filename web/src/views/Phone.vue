@@ -130,7 +130,7 @@ function deviceStatus(device?: PhoneDevice) {
     if (device.native_volte?.ims_registered || device.native_volte?.phase === 'registered') return `${mode} · IMS 已注册`
     if (device.native_volte?.phase === 'registering') return `${mode} · IMS 注册中`
     if (device.native_volte?.phase === 'failed') return `${mode} · 失败`
-    if (device.native_volte?.reboot_required) return `${mode} · 需重启模组`
+    if (device.native_volte?.reboot_required && !device.native_volte?.at_fallback) return `${mode} · 需重启模组`
     if (device.native_volte?.last_error) return `${mode} · ${device.native_volte.last_error}`
     return `${mode} · 连接中`
   }
@@ -498,7 +498,7 @@ async function sendDTMF(digit: string) {
                   ? '这张卡需要使用模组驻网通话，可选择 VoLTE 或已适配的模组直拨。打开「网络」才会用上网流量。'
                   : selected?.native_volte?.uac_unusable
                     ? '这台模组的 USB 声卡不能开（会把 QMI 打挂）。VoLTE 信令能打，没有模组声音。'
-                    : selected?.native_volte?.reboot_required
+                    : selected?.native_volte?.reboot_required && !selected?.native_volte?.at_fallback
                       ? '原生 IMS 已写入。UAC 声卡要重启模组后才出现，现在可以试信令，音频可能不可用。'
                       : '会驻网并用模组原生 IMS 打电话，不走软件 WiFi calling。打开「网络」才会用上网流量。' }}
               </p>

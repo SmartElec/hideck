@@ -344,6 +344,9 @@ func (c *Controller) enableATFallback(ctx context.Context, deviceID string, caus
 	c.patch(deviceID, func(st *Status) {
 		st.QMIIMSUnavailable = true
 		st.ATFallback = true
+		// provision 阶段为了开 UAC 会置 reboot_required；AT 降级用主机 ALSA 出声，
+		// 既不需要 UAC 也不需要重启模组，留着只会让首页一直提示"需重启模组"。
+		st.RebootRequired = false
 		st.IMSEnabled = probe.IMSEnabled
 		st.VoLTEEnabled = probe.IMSEnabled
 		st.IMSPDNActive = probe.IMSPDN

@@ -744,6 +744,80 @@ func findAudioDevice(usbPath string) (string, int) {
 	return alsaDev, cardNum
 }
 
+// findAudioDeviceByUSBID 用 /proc/asound/card*/usbid 反查模组声卡。
+//
+// AT 后端（ECM/RNDIS，没有 QMI 控制面）里 USBPath 常常是空的或随重枚举变化，
+// findAudioDevice 的 sysfs 路径匹配就会失手：声卡明明能开（EC20F 的 card2
+// 就叫 "USB-Audio - Android"），上层却拿到空设备名，于是通话无音频、录音报
+// "声卡不可用"。UAC 声卡的 usbid 与模组的 VID:PID 必然一致，用它关联最稳。
+func findAudioDeviceByUSBID(usbPath string) (string, int) {
+	if modemUACUnusable(usbPath) {
+		return "", -1
+	}
+	usbPath = strings.TrimSpace(usbPath)
+	if usbPath == "" {
+		return findSoleUSBAudioCard()
+	}
+	want := strings.ToLower(readSysfsText(filepath.Join(usbPath, "idVendor")) + ":" +
+		readSysfsText(filepath.Join(usbPath, "idProduct")))
+	if want == ":" {
+		return findSoleUSBAudioCard()
+	}
+	matches, err := filepath.Glob("/proc/asound/card*/usbid")
+	if err != nil {
+		return "", -1
+	}
+	for _, path := range matches {
+		if strings.ToLower(readSysfsText(path)) != want {
+			continue
+		}
+		cardNum, err := strconv.Atoi(strings.TrimPrefix(filepath.Base(filepath.Dir(path)), "card"))
+		if err != nil {
+			continue
+		}
+		return fmt.Sprintf("hw:%d,0", cardNum), cardNum
+	}
+	return "", -1
+}
+
+// findSoleUSBAudioCard 在拿不到 VID/PID 时退化处理：只有一张 USB 声卡才认领，
+// 多于一张说明机器上还有别的 USB 音频设备，猜错会串音，宁可不选。
+func findSoleUSBAudioCard() (string, int) {
+	data, err := os.ReadFile("/proc/asound/cards")
+	if err != nil {
+		return "", -1
+	}
+	cardNum := parseSoleUSBAudioCard(string(data))
+	if cardNum < 0 {
+		return "", -1
+	}
+	return fmt.Sprintf("hw:%d,0", cardNum), cardNum
+}
+
+// parseSoleUSBAudioCard 从 /proc/asound/cards 里挑出唯一的 USB 声卡号。
+// 多于一张就返回 -1：认错卡会把音频串到别处，比没音频更难查。
+func parseSoleUSBAudioCard(data string) int {
+	cardNum := -1
+	for _, line := range strings.Split(data, "\n") {
+		if !strings.Contains(line, "USB-Audio") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		num, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		if cardNum >= 0 && cardNum != num {
+			return -1
+		}
+		cardNum = num
+	}
+	return cardNum
+}
+
 // String 返回便于日志输出的简短设备描述。
 func (m QMIDevice) String() string {
 	s := fmt.Sprintf("%s (%s) [%04x:%04x] driver=%s AT=%s Backup=%s",

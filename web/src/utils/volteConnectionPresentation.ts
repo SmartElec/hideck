@@ -38,7 +38,9 @@ export function volteServiceState(enabled: boolean, status?: NativeVoLTEStatus):
       detail: '打开卡策略里的电话后，模组会注册原生 IMS'
     })
   }
-  if (status?.reboot_required) {
+  // AT 降级下通话音频走主机 ALSA 声卡，不需要模组 UAC，重启模组也解决不了，
+  // 后端已不再置该标志；这里再容一次脏状态，避免首页一直挂着"需重启模组"。
+  if (status?.reboot_required && !status?.at_fallback) {
     return Object.freeze({
       tone: 'is-pending',
       title: 'VoLTE 需重启模组',

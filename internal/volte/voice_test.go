@@ -75,6 +75,19 @@ func TestQPCMVFailureIsExposedWithoutDisablingAudio(t *testing.T) {
 	}
 }
 
+func TestAudioErrorIgnoresUACUnderATFallback(t *testing.T) {
+	// EC20F 这类模块的 QCFG uac 开关是关的，但声卡照样枚举、照样能开。
+	// AT 降级下若还按 uac_enabled 判定，正常通话会被误报成"需要重启模组"。
+	st := Status{ATFallback: true, RebootRequired: true, AudioDevice: "hw:2,0"}
+	if got := audioError(st); got != "" {
+		t.Fatalf("AT 降级探测到声卡时不该报错: %q", got)
+	}
+	st.AudioDevice = ""
+	if got := audioError(st); !strings.Contains(got, "未检测到模组声卡") {
+		t.Fatalf("audioError=%q", got)
+	}
+}
+
 func TestBeginCallReusesIndicationCallID(t *testing.T) {
 	ctl, host := enableVoice(t)
 	var events []voicehost.CallEvent

@@ -282,10 +282,15 @@ func (p *Pool) AudioDevice(deviceID string) string {
 		return dev
 	}
 	usbPath := strings.TrimSpace(w.Config.USBPath)
-	if usbPath == "" {
-		return ""
+	if usbPath != "" {
+		if dev, _ := findAudioDevice(usbPath); dev != "" {
+			w.Config.AudioDevice = dev
+			return dev
+		}
 	}
-	dev, _ := findAudioDevice(usbPath)
+	// sysfs 路径匹配在 AT 后端经常失手（USBPath 为空或重枚举后变化），
+	// 再用声卡自己的 usbid 兜一次，否则上层会把"有声卡"当成"没声卡"。
+	dev, _ := findAudioDeviceByUSBID(usbPath)
 	if dev != "" {
 		w.Config.AudioDevice = dev
 	}

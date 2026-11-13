@@ -449,6 +449,11 @@ func (c *Controller) syncAudioStatus(deviceID string, nvUAC bool) {
 			return
 		}
 		st.UACEnabled = false
+		if st.ATFallback {
+			// AT 降级不依赖模组 UAC 开关，重启模组也换不来声卡，留着只会误报。
+			st.RebootRequired = false
+			return
+		}
 		if nvUAC {
 			st.RebootRequired = true
 		}

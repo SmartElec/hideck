@@ -15,6 +15,7 @@ export type PhoneDevice = {
     volte_enabled?: boolean
     voice_available?: boolean
     reboot_required?: boolean
+    at_fallback?: boolean
     last_error?: string
     uac_enabled?: boolean
     uac_unusable?: boolean
