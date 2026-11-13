@@ -112,6 +112,13 @@ type atCall struct {
 	// LongRing 标记"响铃超过 10 秒"的日志已经打过。现场反馈"对方挂了很久
 	// 才结束"时，靠它区分是对端一直没接、还是本地轮询没收到释放。
 	LongRing bool
+	// RingLog 是上一次回铃音频采样的时间，响铃期间每秒打一条。
+	RingLog time.Time
+	// RingFrames/RingLoud 是上次采样时的累计计数器，用来算每秒增量：
+	// 声卡还在出帧但不再有声 = 模组/网络把声音停了；连帧都没了 = 我们这边
+	// 读声卡卡住；两者都还在而浏览器听不到 = 问题在网页媒体那一段。
+	RingFrames uint64
+	RingLoud   uint64
 }
 
 type atVoice struct {
@@ -598,6 +605,7 @@ func (c *Controller) atApplyCall(voice *atVoice, tracked *atCall, call modemvoic
 		logger.Info("VoLTE(AT) 拨号仍在响铃", "device", deviceID, "clcc_index", call.Index,
 			"peer", tracked.Peer, "state", state, "elapsed", now.Sub(tracked.Start).Round(time.Second).String())
 	}
+	c.logRingbackAudio(deviceID, tracked, state, now)
 	c.storeATCall(voice, tracked)
 
 	if tracked.Direction == "inbound" && !tracked.Rang && created && call.State == modemvoice.Incoming {
@@ -644,6 +652,42 @@ func (c *Controller) atIncoming(voice *atVoice, tracked *atCall, now time.Time) 
 		DeviceID: deviceID, CallID: tracked.ID, Caller: tracked.Peer, State: "ringing",
 		ReceivedAt: now, OfferSDP: sdp,
 	})
+}
+
+// logRingbackAudio 在响铃期间每秒记录一次模组侧音频能量。现场"回铃音只响了
+// 半句就没声"，到底是网络只放了一遍、模组不再出声，还是我们没把帧发出去，只能
+// 靠"每秒有声帧数 + 每秒发帧数"这两列分开：有声帧归零而发帧仍在 = 模组不出声
+// （网络停播）；两者同时归零 = 我们读声卡断了；两者都正常而现场仍听不到 = 问题
+// 在网页媒体那一段。
+func (c *Controller) logRingbackAudio(deviceID string, tracked *atCall, state string, now time.Time) {
+	if tracked.Direction != "outbound" || tracked.Connected || (state != "ringing" && state != "calling") {
+		return
+	}
+	if !tracked.RingLog.IsZero() && now.Sub(tracked.RingLog) < time.Second {
+		return
+	}
+	media := c.media.get(tracked.ID)
+	if media == nil || media.bridge == nil {
+		return
+	}
+	heard, lastLoud, rms := media.bridge.Ringback()
+	_, frames, _, _, _ := media.bridge.Stats()
+	loud := media.bridge.LoudFrames()
+	silence := "none"
+	if heard {
+		silence = now.Sub(lastLoud).Round(100 * time.Millisecond).String()
+	}
+	sent, voiced := uint64(0), uint64(0)
+	if !tracked.RingLog.IsZero() && frames >= tracked.RingFrames {
+		sent = frames - tracked.RingFrames
+	}
+	if loud >= tracked.RingLoud {
+		voiced = loud - tracked.RingLoud
+	}
+	tracked.RingLog, tracked.RingFrames, tracked.RingLoud = now, frames, loud
+	logger.Info("VoLTE(AT) 回铃音频", "device", deviceID, "clcc_index", tracked.Index,
+		"peer", tracked.Peer, "state", state, "heard", heard, "rms", rms, "silent_for", silence,
+		"frames_1s", sent, "loud_1s", voiced)
 }
 
 func (c *Controller) atEndCall(voice *atVoice, tracked *atCall, reason string) {

@@ -1,7 +1,11 @@
 package volte
 
 import (
+	"fmt"
+	"math"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,7 +66,51 @@ type PCMBridge struct {
 	overflow   atomic.Uint64
 	jitterMu   sync.Mutex
 	jitter     pcmJitterDiagnostics
+
+	// 模组侧音频能量：对方挂断后网络会停掉回铃音，PCM 里只剩静音，而 EC20F
+	// 可能还把通话挂在 alerting 上三十多秒。听不到回铃音才是"对端已经不在
+	// 了"的最早证据，所以单独记最后一次有声帧和它的大小。
+	heard  atomic.Bool
+	loudAt atomic.Int64 // UnixNano
+	level  atomic.Int64 // 最近一帧的 RMS
+	// loud 累计有声帧数：现场只能看到声音断了，用它区分"模组不再出声"和"我们没发"。
+	loud atomic.Uint64
+	// dump 是排查"回铃音/提示音只响半句"用的原始下行 PCM 录音。现场反馈的
+	// 断点只能靠波形定性：数字静音说明模组上游就没有内容，有底噪说明是编码
+	// 或增益问题。开关是文件而不是环境变量，容器里不需要重启就能开关。
+	dump     *os.File
+	dumpPath string
 }
+
+// ringbackRMSThreshold 是判定"这一帧有声音"的 RMS 门限。8kHz PCMU 的静音帧
+// 基本是 0，回铃音通常上千；300 既不会漏掉偏轻的回铃音，也不会被底噪触发。
+const ringbackRMSThreshold = 300
+
+func frameRMS(samples []int16) int64 {
+	if len(samples) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, sample := range samples {
+		value := float64(sample)
+		sum += value * value
+	}
+	return int64(math.Sqrt(sum / float64(len(samples))))
+}
+
+// Ringback 报告模组侧是否送出过声音、最后一次有声的时刻和最近一帧的 RMS。
+// heard 为 false 时说明整段通话模组都没送来过音频，此时不能用静音判断。
+func (b *PCMBridge) Ringback() (heard bool, lastLoud time.Time, rms int64) {
+	rms = b.level.Load()
+	if !b.heard.Load() {
+		return false, time.Time{}, rms
+	}
+	return true, time.Unix(0, b.loudAt.Load()), rms
+}
+
+// LoudFrames 返回模组侧累计送来的有声帧数。配合 Stats 的 fromPCM 增量，能区分
+// "声卡还在出帧但已经没声音"和"连帧都停了"。
+func (b *PCMBridge) LoudFrames() uint64 { return b.loud.Load() }
 
 type pcmRTPArrival struct {
 	packet     *rtp.Packet
@@ -78,10 +126,57 @@ type pcmWriteLogState struct {
 
 func NewPCMBridge(conn net.PacketConn, remote net.Addr, pcm PCMPort, listenOnly bool) *PCMBridge {
 	b := &PCMBridge{conn: conn, remote: remote, pcm: pcm, listenOnly: listenOnly, closed: make(chan struct{}), buffer: newAdaptivePCMBuffer()}
+	b.dump, b.dumpPath = openPCMDump()
 	b.workers.Add(2)
 	go b.downlink()
 	go b.uplink()
 	return b
+}
+
+// pcmDumpSwitch 是打开原始下行 PCM 录音的开关文件名。放在日志目录里，宿主机
+// touch/rm 即可开关，下一通电话生效，不需要重启容器。
+const pcmDumpSwitch = "pcm-dump.on"
+
+// openPCMDump 在开关文件存在时创建一个 8kHz/16bit/单声道的裸 PCM 文件。
+// 录的是"我们刚从模组声卡读到的东西"，因此能把"模组没送出声音"和"送出来了
+// 但我们没转发"彻底分开。
+func openPCMDump() (*os.File, string) {
+	dir := os.Getenv("HIDECK_LOG_DIR")
+	if dir != "" {
+		return dumpInto([]string{dir})
+	}
+	// 容器里日志目录挂在 /app/logs，宿主机是 /opt/hideck/logs；两种都试一遍，
+	// 免得部署形态一变就静默失效。
+	return dumpInto([]string{"/app/logs", "/opt/hideck/logs", "logs"})
+}
+
+func dumpInto(dirs []string) (*os.File, string) {
+	for _, dir := range dirs {
+		if _, err := os.Stat(filepath.Join(dir, pcmDumpSwitch)); err != nil {
+			continue
+		}
+		path := filepath.Join(dir, fmt.Sprintf("pcm-%s.raw", time.Now().Format("150405")))
+		f, err := os.Create(path)
+		if err != nil {
+			logger.Warn("VoLTE 原始音频录制开启失败", "path", path, "err", err)
+			return nil, ""
+		}
+		logger.Info("VoLTE 开始录制模组下行音频", "path", path)
+		return f, path
+	}
+	return nil, ""
+}
+
+func (b *PCMBridge) writeDump(samples []int16) {
+	if b.dump == nil {
+		return
+	}
+	buf := make([]byte, len(samples)*2)
+	for i, v := range samples {
+		buf[i*2] = byte(v)
+		buf[i*2+1] = byte(v >> 8)
+	}
+	_, _ = b.dump.Write(buf)
 }
 
 func (b *PCMBridge) Stats() (toPCM, fromPCM, silent, lost, overflow uint64) {
@@ -99,6 +194,10 @@ func (b *PCMBridge) Close() error {
 			_ = b.pcm.Close()
 		}
 		b.workers.Wait()
+		if b.dump != nil {
+			_ = b.dump.Close()
+			logger.Info("VoLTE 原始音频录制已结束", "path", b.dumpPath, "from_modem", b.fromPCM.Load(), "loud", b.loud.Load())
+		}
 		diagnostics := diagnosticsForPCM(b.pcm)
 		jitter := b.jitterStats()
 		// 挂断即打模组侧统计：toPCM/overflow 才是"音频是否真的进了模组"的
@@ -247,6 +346,13 @@ func (b *PCMBridge) uplink() {
 				} else {
 					copy(samples, frame)
 					b.fromPCM.Add(1)
+					b.writeDump(samples)
+					if rms := frameRMS(samples); rms >= ringbackRMSThreshold {
+						b.level.Store(rms)
+						b.loudAt.Store(time.Now().UnixNano())
+						b.heard.Store(true)
+						b.loud.Add(1)
+					}
 				}
 			}
 			payload := phone.EncodePCMU(samples)
