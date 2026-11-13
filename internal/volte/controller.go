@@ -208,33 +208,39 @@ func (c *Controller) Disable(deviceID string) {
 			}
 		}
 		// AT 降级的 CLCC 轮询必须先停，否则会话销毁后它还会继续打 AT。
-		c.stopATVoice(deviceID)
-		c.mu.Lock()
-		var unsubscribe []func()
-		if s := c.sess[deviceID]; s != nil {
-			s.gen++
-			unsubscribe = append(unsubscribe, s.imsUnsubscribe...)
-			s.imsUnsubscribe = nil
-			if s.voice != nil {
-				unsubscribe = append(unsubscribe, s.voice.unsubscribe)
-				s.voice.unsubscribe = nil
-				s.voice.attached = false
-			}
-		}
-		delete(c.sess, deviceID)
-		c.mu.Unlock()
-		for _, cancel := range unsubscribe {
-			if cancel != nil {
-				cancel()
-			}
-		}
-		if c.host != nil {
-			if err := c.host.ReleaseIMSClients(deviceID); err != nil {
-				logger.Warn("释放原生 IMS 客户端失败", "device", deviceID, "err", err)
-			}
-		}
+		c.dropSession(deviceID)
 		return nil
 	})
+}
+
+// dropSession 释放一个设备会话：停掉 AT 轮询、退订 IMS/VOICE 指示、释放
+// IMS 客户端，并把会话从表里摘掉。调用方必须已持有该设备的 withDevice 闸门。
+func (c *Controller) dropSession(deviceID string) {
+	c.stopATVoice(deviceID)
+	c.mu.Lock()
+	var unsubscribe []func()
+	if s := c.sess[deviceID]; s != nil {
+		s.gen++
+		unsubscribe = append(unsubscribe, s.imsUnsubscribe...)
+		s.imsUnsubscribe = nil
+		if s.voice != nil {
+			unsubscribe = append(unsubscribe, s.voice.unsubscribe)
+			s.voice.unsubscribe = nil
+			s.voice.attached = false
+		}
+	}
+	delete(c.sess, deviceID)
+	c.mu.Unlock()
+	for _, cancel := range unsubscribe {
+		if cancel != nil {
+			cancel()
+		}
+	}
+	if c.host != nil {
+		if err := c.host.ReleaseIMSClients(deviceID); err != nil {
+			logger.Warn("释放原生 IMS 客户端失败", "device", deviceID, "err", err)
+		}
+	}
 }
 
 func (c *Controller) Status(deviceID string) Status {

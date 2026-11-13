@@ -65,8 +65,10 @@ type FakeModem struct {
 	QMICore bool
 	// CIREGError 模拟不认 AT+CIREG? 的模组（EC20F 实测返回 ERROR）。
 	CIREGError bool
-	clcc       string
-	DialAT     string
+	// CHUPKeepsCall 模拟挂断后 CLCC 仍报告通话（网络侧尚未释放）。
+	CHUPKeepsCall bool
+	clcc          string
+	DialAT        string
 }
 
 func newFakeModem() *FakeModem {
@@ -200,7 +202,9 @@ func (f *FakeModem) ExecuteAT(deviceID, cmd string, _ time.Duration) (string, er
 	case cmd == "ATA":
 		return "OK\r\n", nil
 	case cmd == "AT+CHUP" || cmd == "ATH":
-		f.clcc = ""
+		if !f.CHUPKeepsCall {
+			f.clcc = ""
+		}
 		return "OK\r\n", nil
 	case cmd == "AT+CHLD=2":
 		return "OK\r\n", nil
