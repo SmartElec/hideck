@@ -21,7 +21,7 @@ type WatchOptions struct {
 func (c *Client) Watch(ctx context.Context, options WatchOptions) error {
 	tracker := NewTracker()
 	return watchSnapshots(ctx, options, watchSource{refresh: func(ctx context.Context) ([]Change, error) {
-		calls, err := c.Calls(ctx)
+		calls, err := c.CallsVerified(ctx)
 		if err != nil {
 			return nil, err
 		}

@@ -16,7 +16,12 @@ type pollExecutor struct {
 	requests chan chan pollResult
 }
 
-func (p pollExecutor) ExecuteATContext(ctx context.Context, _ string, _ time.Duration) (string, error) {
+func (p pollExecutor) ExecuteATContext(ctx context.Context, command string, _ time.Duration) (string, error) {
+	// 这些用例只编排 AT+CLCC 的一问一答；AT+CPAS 是 Client 内部的残留复核，
+	// 直接回“通话中”，保持脚本节奏不变。
+	if command == "AT+CPAS" {
+		return "+CPAS: 4\r\nOK", nil
+	}
 	reply := make(chan pollResult, 1)
 	select {
 	case <-ctx.Done():

@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/yibaiba/hideck/pkg/logger"
 )
 
 const (
@@ -13,7 +17,14 @@ const (
 	callCommandTimeout = 60 * time.Second
 	// clccRetryDelay 只用于“列出通话但收尾报错”的半截响应，别把它当轮询间隔。
 	clccRetryDelay = 250 * time.Millisecond
+	// cpasStrikes 是 CLCC 仍列着通话、CPAS 却报空闲时，连续多少次才判定
+	// 该通话其实已经释放。一次可能是 CLCC/CPAS 采样错位，两次就是真的残留。
+	cpasStrikes = 2
 )
+
+// cpasGrace 给刚下发的 ATD/ATA 留出把 CPAS 推到“通话中”的时间。变量是为了
+// 单测能把等待压到 0，生产路径不要改。
+var cpasGrace = 1500 * time.Millisecond
 
 // Executor is implemented by modem.Manager and shares its SMS/AT queue.
 type Executor interface {
@@ -23,6 +34,16 @@ type Executor interface {
 type Client struct {
 	executor Executor
 	gate     chan struct{}
+
+	// staleMu 保护 stale：按 CLCC 索引记录“CPAS 已空闲”的连续观测次数。
+	staleMu sync.Mutex
+	stale   map[int]staleVoice
+}
+
+// staleVoice 是一路 CLCC 残留通话的观测记录。
+type staleVoice struct {
+	since   time.Time
+	strikes int
 }
 
 func NewClient(executor Executor) (*Client, error) {
@@ -55,6 +76,101 @@ func (c *Client) Calls(ctx context.Context) ([]Call, error) {
 	}
 	defer func() { <-c.gate }()
 	return c.calls(ctx)
+}
+
+// CallsVerified 是给轮询循环用的快照：在 CLCC 之上再用 AT+CPAS 复核一遍。
+// 控制路径（拨号/接听/挂断/DTMF）仍走 Calls，它们需要 CLCC 的原始结论。
+func (c *Client) CallsVerified(ctx context.Context) ([]Call, error) {
+	if err := c.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer func() { <-c.gate }()
+	calls, err := c.calls(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return c.dropReleasedByCPAS(ctx, calls), nil
+}
+
+// dropReleasedByCPAS 用 AT+CPAS 复核 CLCC 快照：EC20F 在对方挂断后偶尔仍把
+// 该通话留在 +CLCC 里（状态停在 alerting/active），而 CPAS 已经回到 0（ready）。
+// 只看 CLCC 的轮询永远等不到“通话消失”，界面就一直停在响铃/通话中。
+//
+// 判定要连续两轮且距首次发现超过 cpasGrace：ATD/ATA 刚下发时 CPAS 还没切到
+// “通话中”，一次采样不足以定论；漏判只会晚一轮结束，误判会直接掐断通话。
+func (c *Client) dropReleasedByCPAS(ctx context.Context, calls []Call) []Call {
+	voice := make([]Call, 0, len(calls))
+	for _, call := range calls {
+		if call.Mode == 0 {
+			voice = append(voice, call)
+		}
+	}
+	if len(voice) == 0 {
+		c.staleMu.Lock()
+		c.stale = nil
+		c.staleMu.Unlock()
+		return calls
+	}
+	status, ok := c.phoneActivity(ctx)
+	now := time.Now()
+	c.staleMu.Lock()
+	defer c.staleMu.Unlock()
+	if !ok || status != cpasReady {
+		// 查不到或者模组明确在通话中：本轮不做判断，观测记录清零重来。
+		c.stale = nil
+		return calls
+	}
+	if c.stale == nil {
+		c.stale = make(map[int]staleVoice, len(voice))
+	}
+	next := make(map[int]staleVoice, len(voice))
+	kept := make([]Call, 0, len(calls))
+	for _, call := range calls {
+		if call.Mode != 0 {
+			kept = append(kept, call)
+			continue
+		}
+		entry, seen := c.stale[call.Index]
+		if !seen {
+			entry = staleVoice{since: now}
+		}
+		entry.strikes++
+		if entry.strikes >= cpasStrikes && now.Sub(entry.since) >= cpasGrace {
+			logger.Warn("CLCC 残留通话已按 CPAS 判定释放", "clcc_index", call.Index,
+				"number", call.Number, "state", int(call.State), "strikes", entry.strikes)
+			continue
+		}
+		next[call.Index] = entry
+		kept = append(kept, call)
+	}
+	c.stale = next
+	return kept
+}
+
+// cpasReady 是 TS 27.007 里 AT+CPAS 的“ready”取值，其余取值都表示模组认为
+// 自己还有活要干（拨号/响铃/通话中/休眠）。
+const cpasReady = 0
+
+// phoneActivity 读 AT+CPAS。失败不是错误：这条命令只用于复核，拿不到结果就
+// 保持 CLCC 的结论。
+func (c *Client) phoneActivity(ctx context.Context) (int, bool) {
+	response, err := c.executor.ExecuteATContext(ctx, "AT+CPAS", queryTimeout)
+	if err != nil {
+		return 0, false
+	}
+	for _, raw := range strings.Split(strings.ReplaceAll(response, "\r", ""), "\n") {
+		line := strings.TrimSpace(raw)
+		if !strings.HasPrefix(line, "+CPAS:") {
+			continue
+		}
+		value := strings.TrimSpace(strings.TrimPrefix(line, "+CPAS:"))
+		status, err := strconv.Atoi(value)
+		if err != nil || status < 0 || status > 5 {
+			return 0, false
+		}
+		return status, true
+	}
+	return 0, false
 }
 
 func (c *Client) calls(ctx context.Context) ([]Call, error) {

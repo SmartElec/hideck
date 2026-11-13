@@ -29,6 +29,8 @@ const (
 	atDtmfTimeout     = 5 * time.Second
 	// EC25/EC21 AT 手册 §12.4：VTS 的时长单位是 100ms。
 	atDtmfDurationTenths = 3
+	// atPollErrLogInterval 是 CLCC 轮询持续失败时的告警间隔。
+	atPollErrLogInterval = 30 * time.Second
 )
 
 // atVoiceATPort 把 Host 的 AT 通道适配成 modemvoice.Port。
@@ -383,8 +385,16 @@ func (c *Controller) startATVoice(deviceID string) *atVoice {
 	deviceID = strings.TrimSpace(deviceID)
 	c.mu.Lock()
 	if existing := c.ensureLocked(deviceID).atVoice; existing != nil {
-		c.mu.Unlock()
-		return existing
+		select {
+		case <-existing.done:
+			// 轮询协程已经退出（会话被重建或 AT 通道长时间不可用），
+			// 不能把死掉的会话交出去，否则再也没有 CLCC 轮询。
+			logger.Warn("VoLTE 降级：CLCC 轮询已停止，重新启动", "device", deviceID)
+			c.ensureLocked(deviceID).atVoice = nil
+		default:
+			c.mu.Unlock()
+			return existing
+		}
 	}
 	client, err := modemvoice.NewClient(atVoiceATPort{host: c.host, deviceID: deviceID})
 	if err != nil {
@@ -421,15 +431,39 @@ func (c *Controller) stopATVoice(deviceID string) {
 
 func (c *Controller) runATVoice(ctx context.Context, voice *atVoice) {
 	defer close(voice.done)
+	var (
+		pollErrSince time.Time
+		pollErrLast  time.Time
+	)
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		calls, err := voice.client.Calls(ctx)
-		if err == nil {
+		// 一台设备只允许一个轮询器。会话被重建/交接后，旧协程必须自己退出：
+		// 多个轮询各自维护一份 atCall，会给同一通电话发出多个 CallID，也会
+		// 把 AT 通道挤到超时，通话状态反而更不可靠。
+		if c.atVoiceSession(voice.deviceID) != voice {
+			logger.Debug("VoLTE 降级：CLCC 轮询已交接，退出", "device", voice.deviceID)
+			return
+		}
+		calls, err := voice.client.CallsVerified(ctx)
+		switch {
+		case err == nil:
+			pollErrSince, pollErrLast = time.Time{}, time.Time{}
 			c.applyATCalls(voice, calls)
-		} else if ctx.Err() == nil {
-			logger.Debug("VoLTE 降级：CLCC 轮询失败", "device", voice.deviceID, "err", err)
+		case ctx.Err() != nil:
+		default:
+			// 轮询失败一直只有 Debug 日志（生产默认关闭），现场只能看到
+			// “界面不动”。按 30 秒一次告警，既能定位又不刷屏。
+			now := time.Now()
+			if pollErrSince.IsZero() {
+				pollErrSince = now
+			}
+			if now.Sub(pollErrLast) >= atPollErrLogInterval {
+				pollErrLast = now
+				logger.Warn("VoLTE 降级：CLCC 轮询失败", "device", voice.deviceID,
+					"err", err, "failing_for", now.Sub(pollErrSince).Round(time.Second).String())
+			}
 		}
 		interval := atFallbackPollIdle
 		if voice.busy() {
@@ -559,6 +593,11 @@ func (c *Controller) atEndCall(voice *atVoice, tracked *atCall, reason string) {
 	if voiced != nil && !voiced.markEmitted(tracked.ID, rankKey("completed")) {
 		return
 	}
+	// 结束通路原本没有任何日志：现场只能从"界面不动"反推。补一条，标明
+	// 是本地挂断、CLCC 残留按 CPAS 释放，还是真的通话消失了。
+	logger.Info("VoLTE(AT) 通话结束", "device", deviceID, "clcc_index", tracked.Index,
+		"direction", tracked.Direction, "peer", tracked.Peer, "reason", reason,
+		"connected", tracked.Connected)
 	c.releaseCallAudio(tracked.ID)
 	c.noteVoiceActivity(deviceID)
 	if voiced != nil {

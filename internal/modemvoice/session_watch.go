@@ -28,7 +28,17 @@ func (s *Session) Watch(ctx context.Context, options WatchOptions) error {
 	defer func() { stop(); cancel() }()
 	options.Wakeups = s.wakeups
 	return watchSnapshots(watchCtx, options, watchSource{wake: s.wake, refresh: func(ctx context.Context) ([]Change, error) {
-		update, err := s.Refresh(ctx)
+		update, err := s.refreshVerifiedLocked(ctx)
 		return update.Changes, err
 	}})
+}
+
+// refreshVerifiedLocked 与 Refresh 同一套会话闸门，只是快照多走一次 CPAS 复核。
+func (s *Session) refreshVerifiedLocked(ctx context.Context) (Update, error) {
+	opCtx, release, err := s.enter(ctx)
+	if err != nil {
+		return Update{}, err
+	}
+	defer release()
+	return s.refreshVerified(opCtx)
 }

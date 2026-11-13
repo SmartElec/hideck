@@ -139,6 +139,20 @@ func (s *Session) refresh(ctx context.Context) (Update, error) {
 	if err != nil {
 		return Update{}, err
 	}
+	return s.applyCalls(calls)
+}
+
+// refreshVerified 是轮询专用：多一次 AT+CPAS 复核，用来发现"CLCC 还列着、
+// 模组其实已经挂断"的残留通话。控制路径不走这里，避免多打一条 AT。
+func (s *Session) refreshVerified(ctx context.Context) (Update, error) {
+	calls, err := s.client.CallsVerified(ctx)
+	if err != nil {
+		return Update{}, err
+	}
+	return s.applyCalls(calls)
+}
+
+func (s *Session) applyCalls(calls []Call) (Update, error) {
 	if s.ctx.Err() != nil {
 		return Update{}, ErrSessionClosed
 	}

@@ -21,6 +21,9 @@ func (c *Controller) RetireDevice(deviceID string) error {
 		if s == nil {
 			return nil
 		}
+		// 先停 CLCC 轮询再丢会话，否则协程失去归属却还在打 AT，留下的幽灵
+		// 轮询会给同一通电话发不同的 CallID。
+		c.stopATVoice(deviceID)
 		// Drain callbacks already running before discarding their call/media state.
 		s.events.Lock()
 		defer s.events.Unlock()

@@ -51,6 +51,8 @@ func (c *Controller) DisableForHandoff(ctx context.Context, deviceID string) err
 		if err := c.host.ReleaseIMSClients(deviceID); err != nil {
 			return fmt.Errorf("volte: release IMS clients for handoff: %w", err)
 		}
+		// 走到这里说明当前不是 AT 降级，但历史轮询可能还留着，一并停掉。
+		c.stopATVoice(deviceID)
 		c.mu.Lock()
 		s.gen++
 		delete(c.sess, deviceID)
