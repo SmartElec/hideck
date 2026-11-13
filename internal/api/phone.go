@@ -482,6 +482,9 @@ func (s *Server) respondPhoneError(c businessContext, err error) {
 	case strings.Contains(message, "unavailable"):
 		status = http.StatusServiceUnavailable
 	}
+	// 界面只拿到响应体，日志里再留一份：多路通话的时序问题（来电等待、
+	// 媒体刷新、租约交接）只看 HTTP 状态码很难复现。
+	logger.Warn("电话操作失败", "code", code, "status", status, "message", message)
 	c.JSON(status, gin.H{"status": "error", "code": code, "message": message})
 }
 

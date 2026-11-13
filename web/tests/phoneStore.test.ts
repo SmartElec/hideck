@@ -436,3 +436,70 @@ test('refreshes ringing outbound media but leaves an unclaimed incoming call una
   assert.equal(shouldRefreshCallMedia(call('old', { direction: 'inbound', status: 'ringing' }), 'new'), true)
   assert.equal(shouldRefreshCallMedia(call('new'), 'new'), false)
 })
+
+async function withHangupService(
+  leases: string[],
+  run: () => Promise<void>
+) {
+  const originalHangup = phoneService.hangup
+  const originalHistory = phoneService.history
+  phoneService.hangup = async (_callId: string, lease: string) => { leases.push(lease) }
+  phoneService.history = async () => []
+  try {
+    await run()
+  } finally {
+    phoneService.hangup = originalHangup
+    phoneService.history = originalHistory
+  }
+}
+
+function connectedStore() {
+  setActivePinia(createPinia())
+  const store = usePhoneStore()
+  store.mediaId = 'media-1'
+  store.lease = 'lease-1'
+  store.mediaState = 'connected'
+  store.calls = [
+    call('media-1', { call_id: 'outbound' }),
+    call('media-1', { call_id: 'inbound', direction: 'inbound' })
+  ]
+  return store
+}
+
+test('hanging up one of two calls keeps the shared media lease for the other', async () => {
+  const store = connectedStore()
+  const leases: string[] = []
+  await withHangupService(leases, async () => {
+    await store.hangup(store.calls[0])
+    assert.equal(store.lease, 'lease-1', 'second call lost its control lease')
+    assert.equal(store.mediaId, 'media-1')
+    await store.hangup(store.calls[0])
+  })
+  assert.deepEqual(leases, ['lease-1', 'lease-1'])
+})
+
+test('releasing the last call returns the media session', async () => {
+  const store = connectedStore()
+  await withHangupService([], async () => {
+    await store.hangup(store.calls[0])
+    await store.hangup(store.calls[0])
+  })
+  assert.equal(store.lease, '')
+  assert.equal(store.mediaId, '')
+})
+
+test('call_ended event only drops the media when nothing else uses it', async () => {
+  setActivePinia(createPinia())
+  const store = usePhoneStore()
+  store.mediaId = 'media-1'
+  store.lease = 'lease-1'
+  store.mediaState = 'connected'
+  store.calls = [
+    call('media-1', { call_id: 'a' }),
+    call('media-1', { call_id: 'b', direction: 'inbound' })
+  ]
+  store.handleEvent({ id: 1, type: 'call_ended', call: call('media-1', { call_id: 'a' }), time: '2026-08-13T12:00:00Z' })
+  assert.equal(store.lease, 'lease-1')
+  store.handleEvent({ id: 2, type: 'call_ended', call: call('media-1', { call_id: 'b' }), time: '2026-08-13T12:00:00Z' })
+  assert.equal(store.lease, '')
+})

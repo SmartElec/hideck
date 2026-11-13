@@ -244,7 +244,7 @@ export const usePhoneStore = defineStore('phone', {
         await phoneService.hangup(target.call_id, this.lease)
         this.removeCall(target.call_id)
         this.clearEndingCall(target.call_id)
-        if (target.media_id === this.mediaId) this.releaseMedia()
+        this.releaseMediaIfUnused(target.media_id)
         void this.reloadHistory()
       } catch (error) {
         this.clearEndingCall(target.call_id)
@@ -363,7 +363,7 @@ export const usePhoneStore = defineStore('phone', {
       else this.upsertCall(event.call)
       if (event.type === 'call_ended') {
         this.clearEndingCall(event.call.call_id)
-        if (event.call.media_id === this.mediaId) this.releaseMedia()
+        this.releaseMediaIfUnused(event.call.media_id)
         void this.reloadHistory()
       } else if (event.type === 'recording_ready' || event.type === 'recording_failed') {
         void this.reloadHistory()
@@ -437,6 +437,15 @@ export const usePhoneStore = defineStore('phone', {
       this.mediaMode = 'none'
       this.muted = false
       this.saveControl()
+    },
+
+    // 呼叫等待时前后两通电话共用同一个 WebRTC 媒体会话。释放媒体会把租约
+    // 一起清空，剩下那通就再也控制不了自己，后端只会回
+    // phone: control lease does not own this call。所以等到没有通话再用这路媒体。
+    releaseMediaIfUnused(mediaId?: string) {
+      if (!mediaId || mediaId !== this.mediaId) return
+      if (this.calls.some((call) => call.media_id === mediaId)) return
+      this.releaseMedia()
     },
 
     releaseMedia() {
