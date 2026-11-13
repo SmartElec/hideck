@@ -31,10 +31,20 @@ const (
 	atDtmfDurationTenths = 3
 	// atPollErrLogInterval 是 CLCC 轮询持续失败时的告警间隔。
 	atPollErrLogInterval = 30 * time.Second
+	// atWakeupDebounce 合并同一次事件里的连续 URC（RING→+CLIP→+CCWA、
+	// NO CARRIER 连发），避免把 AT 队列塞满无效的 CLCC。
+	atWakeupDebounce = 150 * time.Millisecond
 )
 
+// voiceChangeSource 是 Host 的可选能力：把语音 URC 变成“该刷新 CLCC 了”的
+// 唤醒信号。Host 接口本身不强制，测试假实现可以没有。
+type voiceChangeSource interface {
+	SubscribeVoiceChanges(deviceID string) (<-chan struct{}, func())
+}
+
 // atVoiceATPort 把 Host 的 AT 通道适配成 modemvoice.Port。
-// 降级路径没有 URC 订阅者，通话状态完全靠 CLCC 轮询。
+// 降级路径没有 QMI 语音指示，通话状态靠 CLCC 轮询；Host 支持语音 URC 时，
+// 轮询循环会被 URC 唤醒提前刷新，对方挂断能在一个 RTT 内反映到界面。
 type atVoiceATPort struct {
 	host     Host
 	deviceID string
@@ -63,6 +73,17 @@ func (p atVoiceATPort) ExecuteATContext(ctx context.Context, command string, tim
 }
 
 func (p atVoiceATPort) SubscribeVoiceChanges() (<-chan struct{}, func()) {
+	if p.host != nil {
+		if source, ok := p.host.(voiceChangeSource); ok {
+			wakeups, unsubscribe := source.SubscribeVoiceChanges(p.deviceID)
+			if wakeups != nil && unsubscribe != nil {
+				return wakeups, unsubscribe
+			}
+			if unsubscribe != nil {
+				unsubscribe()
+			}
+		}
+	}
 	return make(chan struct{}), func() {}
 }
 
@@ -88,6 +109,9 @@ type atCall struct {
 	// 一路通话（尤其是 waiting），单次缺失就当挂断会换掉 CallID，上层于是
 	// 把同一路来电当成新来电反复判忙。
 	Misses int
+	// LongRing 标记"响铃超过 10 秒"的日志已经打过。现场反馈"对方挂了很久
+	// 才结束"时，靠它区分是对端一直没接、还是本地轮询没收到释放。
+	LongRing bool
 }
 
 type atVoice struct {
@@ -95,6 +119,10 @@ type atVoice struct {
 	client   *modemvoice.Client
 	cancel   context.CancelFunc
 	done     chan struct{}
+
+	// wakeups 是模组语音 URC 的唤醒通道；没有 URC 归属方时为永不触发的通道。
+	wakeups     <-chan struct{}
+	unsubscribe func()
 
 	mu      sync.Mutex
 	calls   map[int]*atCall
@@ -396,14 +424,17 @@ func (c *Controller) startATVoice(deviceID string) *atVoice {
 			return existing
 		}
 	}
-	client, err := modemvoice.NewClient(atVoiceATPort{host: c.host, deviceID: deviceID})
+	port := atVoiceATPort{host: c.host, deviceID: deviceID}
+	client, err := modemvoice.NewClient(port)
 	if err != nil {
 		c.mu.Unlock()
 		logger.Error("VoLTE 降级：AT 语音通道初始化失败", "device", deviceID, "err", err)
 		return nil
 	}
+	wakeups, unsubscribe := port.SubscribeVoiceChanges()
 	ctx, cancel := context.WithCancel(context.Background())
-	voice := &atVoice{deviceID: deviceID, client: client, cancel: cancel, done: make(chan struct{}), calls: map[int]*atCall{}}
+	voice := &atVoice{deviceID: deviceID, client: client, cancel: cancel, done: make(chan struct{}),
+		wakeups: wakeups, unsubscribe: unsubscribe, calls: map[int]*atCall{}}
 	c.ensureLocked(deviceID).atVoice = voice
 	c.mu.Unlock()
 	go c.runATVoice(ctx, voice)
@@ -431,10 +462,18 @@ func (c *Controller) stopATVoice(deviceID string) {
 
 func (c *Controller) runATVoice(ctx context.Context, voice *atVoice) {
 	defer close(voice.done)
+	defer func() {
+		if voice.unsubscribe != nil {
+			voice.unsubscribe()
+		}
+	}()
 	var (
 		pollErrSince time.Time
 		pollErrLast  time.Time
 	)
+	// 通道可能被上游关闭（模组重启/管理器停止）。取本地副本，读到关闭就把
+	// 它摘掉，否则 select 会一直命中已关闭的通道，轮询会变成死循环。
+	wakeups := voice.wakeups
 	for {
 		if ctx.Err() != nil {
 			return
@@ -477,6 +516,20 @@ func (c *Controller) runATVoice(ctx context.Context, voice *atVoice) {
 		case <-ctx.Done():
 			timer.Stop()
 			return
+		case _, ok := <-wakeups:
+			timer.Stop()
+			if !ok {
+				wakeups = nil
+				continue
+			}
+			// 语音 URC 只说明"状态可能变了"，具体状态仍由下一轮 CLCC 决定。
+			// 短暂合并后立即重查，把对方挂断/接听的反映时间从一整个轮询
+			// 周期压到一个 AT 往返。
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(atWakeupDebounce):
+			}
 		case <-timer.C:
 		}
 	}
@@ -539,6 +592,12 @@ func (c *Controller) atApplyCall(voice *atVoice, tracked *atCall, call modemvoic
 	if state == "connected" {
 		tracked.Connected = true
 	}
+	if !tracked.Connected && !tracked.LongRing && (state == "ringing" || state == "calling") &&
+		now.Sub(tracked.Start) >= 10*time.Second {
+		tracked.LongRing = true
+		logger.Info("VoLTE(AT) 拨号仍在响铃", "device", deviceID, "clcc_index", call.Index,
+			"peer", tracked.Peer, "state", state, "elapsed", now.Sub(tracked.Start).Round(time.Second).String())
+	}
 	c.storeATCall(voice, tracked)
 
 	if tracked.Direction == "inbound" && !tracked.Rang && created && call.State == modemvoice.Incoming {
@@ -597,7 +656,8 @@ func (c *Controller) atEndCall(voice *atVoice, tracked *atCall, reason string) {
 	// 是本地挂断、CLCC 残留按 CPAS 释放，还是真的通话消失了。
 	logger.Info("VoLTE(AT) 通话结束", "device", deviceID, "clcc_index", tracked.Index,
 		"direction", tracked.Direction, "peer", tracked.Peer, "reason", reason,
-		"connected", tracked.Connected)
+		"connected", tracked.Connected,
+		"duration", time.Since(tracked.Start).Round(100*time.Millisecond).String())
 	c.releaseCallAudio(tracked.ID)
 	c.noteVoiceActivity(deviceID)
 	if voiced != nil {
@@ -653,6 +713,7 @@ func (c *Controller) atBeginCall(ctx context.Context, deviceID, callee, sdp stri
 	if err := voice.client.Dial(ctx, callee); err != nil {
 		return voicehost.CallSnapshot{}, err
 	}
+	logger.Info("VoLTE(AT) 拨号已下发", "device", deviceID, "peer", callee)
 	now := time.Now()
 	// ATD 被接受不代表呼叫已建立：先用一次 CLCC 认领 index，认领不到就挂到
 	// pending 上，等轮询把它绑定到同一个 ID。

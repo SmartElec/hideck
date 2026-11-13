@@ -38,6 +38,18 @@ func (p *Pool) ExecuteATContext(ctx context.Context, request ATRequest) (string,
 	return p.executeATContextFor(ctx, request, nil, 0)
 }
 
+// SubscribeVoiceChanges 把模组的语音 URC（RING/+CLIP/+CCWA/CONNECT/NO CARRIER/
+// BUSY/NO ANSWER）汇成唤醒信号。AT 降级链路只能靠 CLCC 轮询看状态，光等定时器
+// 最多会晚一个轮询周期才结束通话；有 URC 就能立刻补一次快照。
+// 没有 AT 归属方（QMI 模式）时返回一个永不触发的通道，调用方按纯轮询处理。
+func (p *Pool) SubscribeVoiceChanges(deviceID string) (<-chan struct{}, func()) {
+	w := p.GetWorker(deviceID)
+	if w == nil || w.Modem == nil || !w.Modem.OwnsATRuntime() {
+		return make(chan struct{}), func() {}
+	}
+	return w.Modem.SubscribeVoiceChanges()
+}
+
 // executeATContextFor runs the request only on expected when it is non-nil:
 // it is refused when expected was replaced before or while waiting for the
 // AT port.

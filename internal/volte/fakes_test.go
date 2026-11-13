@@ -69,6 +69,9 @@ type FakeModem struct {
 	CHUPKeepsCall bool
 	clcc          string
 	DialAT        string
+	// voiceWake 模拟模组的语音 URC 唤醒通道，voiceWakeUnsub 记录退订次数。
+	voiceWake      chan struct{}
+	voiceWakeUnsub int
 }
 
 func newFakeModem() *FakeModem {
@@ -475,4 +478,53 @@ func (w *reenumWaiter) WaitByIMEI(_ context.Context, imei string, _ time.Duratio
 		w.modem.NextPort = ""
 	}
 	return w.modem.ID, nil
+}
+
+// 语音 URC 唤醒：AT 降级链路用它把"该刷新 CLCC 了"提前告诉轮询循环。
+var _ voiceChangeSource = (*FakeModem)(nil)
+
+func (f *FakeModem) SubscribeVoiceChanges(string) (<-chan struct{}, func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.voiceWake == nil {
+		f.voiceWake = make(chan struct{}, 1)
+	}
+	ch := f.voiceWake
+	return ch, func() {
+		f.mu.Lock()
+		f.voiceWakeUnsub++
+		f.mu.Unlock()
+	}
+}
+
+// WakeVoice 模拟模组吐出一条语音 URC（NO CARRIER/BUSY/RING…）。
+func (f *FakeModem) WakeVoice() {
+	f.mu.Lock()
+	ch := f.voiceWake
+	f.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (f *FakeModem) VoiceWakeUnsubscribes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.voiceWakeUnsub
+}
+
+func (f *FakeModem) CountCommand(command string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, cmd := range f.Commands {
+		if cmd == command {
+			count++
+		}
+	}
+	return count
 }
