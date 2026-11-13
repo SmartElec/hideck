@@ -125,43 +125,44 @@ func (s *Service) Answer(ctx context.Context, request ControlRequest) (CallView,
 	return s.callView(callID, request.Lease), nil
 }
 
+// Reject 拒接一路尚未接管的来电，全程不碰媒体会话：拒接不需要音频。
+// 呼叫等待时那路来电与当前通话共用同一个 WebRTC 会话，旧实现按“接听”的
+// 流程去预留媒体，只会拿到 media session already has an active call
+// operation，界面上表现为这通来电根本挂不掉。
 func (s *Service) Reject(request ControlRequest) error {
-	call, _, reservation, err := s.claimIncoming(request)
-	if err != nil {
-		return err
-	}
-	defer s.releaseIncomingClaim(call)
-	defer s.releaseMediaReservation(reservation)
+	callID := strings.TrimSpace(request.CallID)
 	s.mu.Lock()
-	if current := s.calls[request.CallID]; current != call || call.terminal {
+	call := s.calls[callID]
+	if call == nil || call.terminal || call.view.Direction != "inbound" || call.controlPending {
 		s.mu.Unlock()
-		return errActiveCallNotFound
+		return errors.New("phone: pending incoming call not found")
 	}
-	pendingMediaDrop, err := s.bindMediaLocked(request.CallID, reservation)
-	if err != nil {
+	// 已经被别的浏览器接管的来电不能从这里抢走。
+	if call.lease != "" && (!secureEqual(call.lease, request.Lease) || call.owner != request.Owner) {
 		s.mu.Unlock()
-		return err
+		return errors.New("phone: call is controlled by another browser")
 	}
 	call.userRejected = true
-	call.owner, call.lease, call.mediaID = request.Owner, request.Lease, reservation.mediaID
-	call.view.MediaID = reservation.mediaID
+	if call.autoAnswerTimer != nil {
+		call.autoAnswerTimer.Stop()
+		call.autoAnswerTimer = nil
+	}
 	deviceID := call.view.DeviceID
 	s.mu.Unlock()
-	s.resumePendingMediaDrop(reservation.mediaID, pendingMediaDrop)
 	if err := s.gateway.RejectIncomingCall(voicehost.RejectRequest{
-		DeviceID: deviceID, CallID: request.CallID, StatusCode: 486,
+		DeviceID: deviceID, CallID: callID, StatusCode: 486,
 	}); err != nil {
 		return err
 	}
 	s.finishCall(voicehost.CallEvent{
-		Type: "CallCanceled", DeviceID: deviceID, CallID: request.CallID,
+		Type: "CallCanceled", DeviceID: deviceID, CallID: callID,
 		Reason: "local_reject", Time: time.Now(),
 	})
 	return nil
 }
 
 func (s *Service) Hangup(ctx context.Context, owner, callID, lease string) error {
-	call, err := s.controlledCall(owner, callID, lease)
+	call, err := s.hangupTarget(owner, callID, lease)
 	if err != nil {
 		if errors.Is(err, errActiveCallNotFound) {
 			return nil
@@ -296,6 +297,30 @@ func (s *Service) controlledCall(owner, callID, lease string) (*activeCall, erro
 		return nil, errors.New("phone: control lease does not own this call")
 	}
 	return call, nil
+}
+
+// hangupTarget 找出这条挂断请求能操作的通话。已接管的通话按 owner/lease
+// 校验；尚未接管的来电（呼叫等待里的第二路）允许任何浏览器挂断——它没有
+// 媒体会话也就没有租约，否则挂掉第一通之后这路来电就再也没有入口释放了。
+func (s *Service) hangupTarget(owner, callID, lease string) (*activeCall, error) {
+	call, err := s.controlledCall(owner, callID, lease)
+	if err == nil {
+		return call, nil
+	}
+	if errors.Is(err, errActiveCallNotFound) {
+		return nil, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	call = s.calls[strings.TrimSpace(callID)]
+	if call == nil || call.terminal {
+		return nil, errActiveCallNotFound
+	}
+	if call.lease == "" && call.view.Direction == "inbound" &&
+		(call.view.Status == StatusRinging || call.view.Status == StatusWaiting) {
+		return call, nil
+	}
+	return nil, err
 }
 
 func (s *Service) reserveDevice(deviceID string) error {

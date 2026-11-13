@@ -82,6 +82,10 @@ type atCall struct {
 	// ActiveCall().ClientSDP 把网页媒体接进来，缺失会被判成"媒体端点不可用"
 	// 并直接挂断，所以必须镜像进 voiceSession。
 	ClientSDP string
+	// Misses 记录 CLCC 连续漏掉这通电话的次数。EC20F 的快照偶尔会少列
+	// 一路通话（尤其是 waiting），单次缺失就当挂断会换掉 CallID，上层于是
+	// 把同一路来电当成新来电反复判忙。
+	Misses int
 }
 
 type atVoice struct {
@@ -458,11 +462,35 @@ func (c *Controller) applyATCalls(voice *atVoice, calls []modemvoice.Call) {
 	}
 	for _, tracked := range voice.snapshot() {
 		if seen[tracked.Index] {
+			voice.markSeen(tracked)
+			continue
+		}
+		// EC20F 的 CLCC 偶发少列一路通话，等待中的那路尤其容易丢。单次缺失
+		// 就当成挂断会重建 CallID，上层把这通来电判成新的、再判忙拒掉，
+		// 界面上最后连挂断的入口都没有。
+		if voice.markMissed(tracked, atCallMissTolerance) {
 			continue
 		}
 		voice.forget(tracked.Index)
 		c.atEndCall(voice, tracked, "remote_hangup")
 	}
+}
+
+// atCallMissTolerance 是 CLCC 连续漏掉一通电话多少次才判定它已经结束。
+// busy 轮询 800ms 一次，两次约 1.6 秒，够覆盖模组的偶发半截快照。
+const atCallMissTolerance = 2
+
+func (v *atVoice) markSeen(call *atCall) {
+	v.mu.Lock()
+	call.Misses = 0
+	v.mu.Unlock()
+}
+
+func (v *atVoice) markMissed(call *atCall, tolerance int) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	call.Misses++
+	return call.Misses < tolerance
 }
 
 func (c *Controller) atApplyCall(voice *atVoice, tracked *atCall, call modemvoice.Call, created bool, now time.Time) {

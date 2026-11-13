@@ -194,6 +194,11 @@ func controlCommand(target Call, calls []Call, answer bool) (string, error) {
 	if len(calls) == 1 {
 		return "AT+CHUP", nil
 	}
+	if target.State == Waiting {
+		// 27.007：CHLD=1<idx> 释放的是 active/held 的那一路，等待中的通话
+		// 要用 CHLD=0（UDUB，拒接等待来电），它不会挂断当前通话。
+		return "AT+CHLD=0", nil
+	}
 	return fmt.Sprintf("AT+CHLD=1%d", target.Index), nil
 }
 

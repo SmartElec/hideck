@@ -546,7 +546,17 @@ async function sendDTMF(digit: string) {
             <p v-if="identities.identityFor(call.peer, call.device_id)?.name" class="call-number">{{ identities.identityFor(call.peer, call.device_id)?.display_number }}</p>
             <p v-if="identities.subtitleFor(call.peer, call.device_id)" class="call-attribution">{{ identities.subtitleFor(call.peer, call.device_id) }}</p>
             <p>{{ phoneCallStatusLabel(call, callEnding) }} · {{ formatCallDuration(call, phone.now) }}</p>
-            <p v-if="waitingCall" class="call-waiting-hint">第二路来电 {{ identities.titleFor(waitingCall.peer, waitingCall.device_id) }}（呼叫等待）</p>
+            <div v-if="waitingCall" class="call-waiting">
+              <p class="call-waiting-hint">第二路来电 {{ identities.titleFor(waitingCall.peer, waitingCall.device_id) }}（呼叫等待）</p>
+              <button
+                type="button"
+                class="call-waiting-reject"
+                :disabled="!!action || phone.isCallEnding(waitingCall.call_id)"
+                @click="rejectCall(waitingCall)"
+              >
+                <el-icon><CallDismiss24Regular /></el-icon>拒接这路来电
+              </button>
+            </div>
             <button type="button" class="contact-save" :disabled="!call.peer" @click="savePeerContact(call.peer)">
               <el-icon><PersonAdd24Regular /></el-icon>{{ identities.identityFor(call.peer, call.device_id)?.name ? '改联系人' : '加到联系人' }}
             </button>
@@ -585,6 +595,24 @@ async function sendDTMF(digit: string) {
             >
               <el-icon><Call24Regular /></el-icon><span>麦克风接听</span>
             </button>
+          </div>
+
+          <div v-else-if="call.status === 'waiting'" class="takeover-panel">
+            <strong>来电等待中</strong>
+            <p>
+              这通来电在呼叫等待里等接听，和刚才那通共用一条媒体通道，网页侧暂不支持接听。
+              现在可以直接拒接它，不然它会一直挂在模组上。
+            </p>
+            <div class="restore-actions">
+              <button
+                type="button"
+                class="restore-button"
+                :disabled="!!action || callEnding"
+                @click="rejectCall(call)"
+              >
+                <el-icon><CallDismiss24Regular /></el-icon>拒接来电
+              </button>
+            </div>
           </div>
 
           <div v-else-if="call.read_only" class="takeover-panel">

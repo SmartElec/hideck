@@ -503,3 +503,30 @@ test('call_ended event only drops the media when nothing else uses it', async ()
   store.handleEvent({ id: 2, type: 'call_ended', call: call('media-1', { call_id: 'b' }), time: '2026-08-13T12:00:00Z' })
   assert.equal(store.lease, '')
 })
+
+test('rejecting a waiting call keeps the media session that the active call uses', async () => {
+  setActivePinia(createPinia())
+  const store = usePhoneStore()
+  store.mediaId = 'media-1'
+  store.lease = 'lease-1'
+  store.mediaState = 'connected'
+  store.mediaMode = 'two-way'
+  store.calls = [
+    call('media-1', { call_id: 'outbound' }),
+    call('', { call_id: 'waiting', direction: 'inbound', status: 'waiting' })
+  ]
+  const calls: Array<{ callId: string; mediaId: string; lease: string }> = []
+  const originalReject = phoneService.reject
+  phoneService.reject = async (callId: string, mediaId: string, lease: string) => {
+    calls.push({ callId, mediaId, lease })
+  }
+  try {
+    await store.reject(store.calls[1])
+  } finally {
+    phoneService.reject = originalReject
+  }
+  assert.deepEqual(calls, [{ callId: 'waiting', mediaId: 'media-1', lease: 'lease-1' }])
+  assert.equal(store.mediaId, 'media-1', '拒接等待来电不该换掉当前通话的媒体')
+  assert.equal(store.lease, 'lease-1')
+  assert.deepEqual(store.calls.map((item) => item.call_id), ['outbound'])
+})

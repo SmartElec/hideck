@@ -231,9 +231,11 @@ export const usePhoneStore = defineStore('phone', {
     },
 
     async reject(call: PhoneCall) {
-      const media = await this.prepareControlMedia()
-      await phoneService.reject(call.call_id, media.mediaId, media.lease)
-      this.releaseMedia()
+      // 拒接不需要音频：后端也不再为它预留媒体。这里绝不能去 prepare 新媒体，
+      // 呼叫等待时那会顶掉当前通话正在用的媒体会话（lease 一起被换掉）。
+      await phoneService.reject(call.call_id, this.mediaId, this.lease)
+      this.removeCall(call.call_id)
+      this.releaseMediaIfUnused(call.media_id)
     },
 
     async hangup(call?: PhoneCall) {
@@ -320,10 +322,6 @@ export const usePhoneStore = defineStore('phone', {
         this.error = phoneErrorMessage(error, '听筒和麦克风启用失败')
         throw error
       }
-    },
-
-    async prepareControlMedia() {
-      return this.prepareReceiveOnlyMedia()
     },
 
     async prepareReceiveOnlyMedia() {

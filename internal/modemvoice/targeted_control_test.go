@@ -64,8 +64,10 @@ func TestSessionRejectTargetsTheWaitingCall(t *testing.T) {
 	if _, err := s.Hangup(context.Background(), waiting.ID); err != nil {
 		t.Fatal(err)
 	}
-	if got := p.commands[len(p.commands)-1]; got != "AT+CHLD=12" {
-		t.Fatalf("reject command = %q; want AT+CHLD=12", got)
+	// 等待中的那一路只能用 CHLD=0（UDUB）拒掉：CHLD=12 释放的是 active/held，
+	// 既挂不掉等待来电，还会把当前通话一起甩掉。
+	if got := p.commands[len(p.commands)-1]; got != "AT+CHLD=0" {
+		t.Fatalf("reject command = %q; want AT+CHLD=0", got)
 	}
 }
 
@@ -97,7 +99,7 @@ func TestClientHangupTargetsCallByIndex(t *testing.T) {
 	if err := c.Hangup(context.Background(), Call{Index: 2, Inbound: true, State: Waiting, Number: "10086"}); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"AT+CLCC", "AT+CHLD=12"}
+	want := []string{"AT+CLCC", "AT+CHLD=0"}
 	if !reflect.DeepEqual(p.commands, want) {
 		t.Fatalf("commands = %v; want %v", p.commands, want)
 	}
@@ -173,5 +175,38 @@ func TestClientDoesNotRetryTransportErrors(t *testing.T) {
 	}
 	if want := []string{"AT+CLCC"}; !reflect.DeepEqual(stub.commands, want) {
 		t.Fatalf("commands = %v; want %v", stub.commands, want)
+	}
+}
+
+// 呼叫等待时挂掉当前通话走 CHLD=1<idx>，但拒掉等待中的那一路不能用它：
+// 27.007 里 CHLD=1<idx> 释放的是 active/held，等待来电要用 CHLD=0（UDUB）。
+func TestControlCommandRejectsWaitingCallWithoutDroppingTheActiveOne(t *testing.T) {
+	active := Call{Index: 1, State: Active, Number: "10086"}
+	waiting := Call{Index: 2, State: Waiting, Inbound: true, Number: "15882275310"}
+	both := []Call{active, waiting}
+
+	command, err := controlCommand(waiting, both, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command != "AT+CHLD=0" {
+		t.Fatalf("拒接等待来电的命令 = %q", command)
+	}
+
+	command, err = controlCommand(active, both, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command != "AT+CHLD=11" {
+		t.Fatalf("挂断当前通话的命令 = %q", command)
+	}
+
+	// 只剩等待中的那一路时仍然用 CHUP（已验证过的单路路径）。
+	command, err = controlCommand(waiting, []Call{waiting}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command != "AT+CHUP" {
+		t.Fatalf("单路拒接的命令 = %q", command)
 	}
 }
