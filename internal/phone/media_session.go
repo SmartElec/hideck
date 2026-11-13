@@ -171,6 +171,14 @@ func (s *MediaSession) Attach(remoteSDP string) error {
 	if err != nil {
 		return err
 	}
+	// 响铃阶段已经按同一个端点接上过：接通的回调会再调一次 Attach，这里直接
+	// 返回，避免重建编解码器、重发 primeRelay 造成的瞬时断音。
+	s.mu.RLock()
+	current, attached := s.remote, s.attached
+	s.mu.RUnlock()
+	if attached && sameRTPEndpoint(current, endpoint) {
+		return nil
+	}
 	codec, err := s.createRealtimeCodec(endpoint)
 	if err != nil {
 		return err
@@ -189,6 +197,19 @@ func (s *MediaSession) Attach(remoteSDP string) error {
 		s.startSilentRTP()
 	}
 	return errors.Join(closeErr, primeErr)
+}
+
+// sameRTPEndpoint 判断两个端点是否指向同一个远端媒体流（编解码参数也算），
+// 用来判断重复 Attach 是否只是同一次桥接的回调重入。
+func sameRTPEndpoint(a, b rtpEndpoint) bool {
+	if a.Codec != b.Codec || a.PayloadType != b.PayloadType ||
+		a.ClockRate != b.ClockRate || a.Fmtp != b.Fmtp {
+		return false
+	}
+	if a.Address == nil || b.Address == nil {
+		return a.Address == nil && b.Address == nil
+	}
+	return a.Address.Port == b.Address.Port && a.Address.IP.Equal(b.Address.IP)
 }
 
 func (s *MediaSession) createRealtimeCodec(endpoint rtpEndpoint) (RealtimeCodec, error) {

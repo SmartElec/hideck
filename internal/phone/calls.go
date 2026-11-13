@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/iniwex5/vowifi-go/runtimehost/voicehost"
+	"github.com/yibaiba/hideck/pkg/logger"
 )
 
 var calleePattern = regexp.MustCompile(`^\+?[0-9]{1,32}$`)
@@ -59,12 +60,36 @@ func (s *Service) StartCall(request StartCallRequest) (CallView, error) {
 		return CallView{}, errors.Join(bindErr, hangupErr)
 	}
 	s.resumePendingMediaDrop(call.mediaID, pendingMediaDrop)
+	// 出站呼叫一拨出去就把浏览器媒体接到模组侧：回铃音、运营商提示音
+	// （"正在通话中"/"不在服务区"）都是响铃阶段的早期媒体，等到接通才接媒体
+	// 会让浏览器整段响铃完全静音，用户既听不到回铃也听不到忙音提示。
+	s.attachEarlyOutboundMedia(call.view.CallID, call.mediaID, snapshot.ClientSDP)
 	s.persist(call.record)
 	s.publish("call_started", call)
 	for _, event := range pendingEvents {
 		s.dispatchCallEvent(event)
 	}
 	return s.callView(call.view.CallID, request.Lease), err
+}
+
+// attachEarlyOutboundMedia 在响铃阶段把浏览器媒体接到模组侧端点。
+//
+// 与接通后的 attachOutboundMedia 不同：这里失败只告警、绝不挂断。部分后端要等
+// 接通才给出协商结果，此时没有端点属于正常；真到接通还拿不到，由
+// attachOutboundMedia 的严格检查去终结这通电话。
+func (s *Service) attachEarlyOutboundMedia(callID, mediaID, clientSDP string) {
+	clientSDP = strings.TrimSpace(clientSDP)
+	if clientSDP == "" {
+		return
+	}
+	media := s.media.Get(mediaID)
+	if media == nil {
+		return
+	}
+	if err := media.Attach(clientSDP); err != nil {
+		logger.Warn("出站通话响铃阶段媒体桥接失败，接通后再试",
+			"call_id", callID, "media_id", mediaID, "err", err)
+	}
 }
 
 func (s *Service) newOutboundCall(
