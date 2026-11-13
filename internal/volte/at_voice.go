@@ -78,6 +78,10 @@ type atCall struct {
 	Start     time.Time
 	Rang      bool // 来电已经通过 IncomingCall 上报给上层
 	Connected bool
+	// ClientSDP 是控制器侧音频端点的 SDP。phone 包在 CallAnswered 时用
+	// ActiveCall().ClientSDP 把网页媒体接进来，缺失会被判成"媒体端点不可用"
+	// 并直接挂断，所以必须镜像进 voiceSession。
+	ClientSDP string
 }
 
 type atVoice struct {
@@ -563,6 +567,7 @@ func (c *Controller) storeATCall(voice *atVoice, tracked *atCall) {
 	s.voice.put(nativeCall{
 		ID: tracked.ID, QMI: uint8(index), Direction: tracked.Direction, Peer: tracked.Peer,
 		State: tracked.State, Start: tracked.Start, Held: tracked.Held,
+		ClientSDP: tracked.ClientSDP,
 	})
 }
 
@@ -613,6 +618,9 @@ func (c *Controller) atBeginCall(ctx context.Context, deviceID, callee, sdp stri
 	} else {
 		callSDP = media.sdp
 		c.media.put(tracked.ID, media)
+		// 端点就绪后补一次镜像，让 ActiveCall 能带上 ClientSDP。
+		tracked.ClientSDP = callSDP
+		c.storeATCall(voice, tracked)
 	}
 	c.emitEvent(deviceID, voicehost.CallEvent{
 		Type: "CallRinging", DeviceID: deviceID, CallID: tracked.ID, Callee: callee,
