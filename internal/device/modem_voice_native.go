@@ -11,6 +11,7 @@ import (
 	"github.com/yibaiba/hideck/internal/modemvoice/audio"
 	"github.com/yibaiba/hideck/internal/modemvoice/host"
 	"github.com/yibaiba/hideck/internal/modemvoice/media"
+	"github.com/yibaiba/hideck/pkg/logger"
 )
 
 // 原生声卡路线不设固件白名单：除已验证的 EC20CEFAGR08A03M4G 外，其他 EC20
@@ -39,9 +40,23 @@ func prepareNativeVoice(ctx context.Context, port *modemVoicePort) (*host.Resour
 	if modemUACUnusable(usbPath) {
 		return nil, errors.New("模组 USB 声卡不可用（打开会破坏 QMI），拒绝原生音频")
 	}
-	if _, err := audio.ResolveUSBPCM(usbPath); err != nil {
-		return nil, fmt.Errorf("未找到模组原生 USB 声卡，无法走原生音频: %w", err)
+	endpoint, err := audio.ResolveUSBPCM(usbPath)
+	if err != nil {
+		// 只有 AT 后端的设备（ECM/RNDIS，没有 QMI）经常没有 USBPath，或设备
+		// 重枚举后路径失效：按路径找不到声卡不等于模组没有声卡。退回"全机唯一
+		// 一个双向 USB 声卡"，多声卡机器仍然拒绝，绝不猜。
+		sole, soleErr := audio.ResolveSoleUSBPCM()
+		if soleErr != nil {
+			return nil, fmt.Errorf("未找到模组原生 USB 声卡，无法走原生音频: %w", err)
+		}
+		if modemUACUnusable(sole.USBPath) {
+			return nil, errors.New("模组 USB 声卡不可用（打开会破坏 QMI），拒绝原生音频")
+		}
+		logger.Info("模组直拨：USBPath 不可用，改用全机唯一的 USB 声卡",
+			"device", port.worker.ID, "usb", sole.USBPath, "alsa", sole.ALSADevice())
+		endpoint = sole
 	}
+	usbPath = endpoint.USBPath
 	alsa := audio.ALSA{CaptureProgram: capture, PlaybackProgram: playback}
 	return &host.Resources{
 		Port:    port,
@@ -62,7 +77,10 @@ func prepareNativeVoice(ctx context.Context, port *modemVoicePort) (*host.Resour
 				},
 				Resolve: func() (audio.Endpoint, error) {
 					// 声卡号随枚举变化，每次现解析，与 QDC507 路径同一约定。
-					return audio.ResolveUSBPCM(usbPath)
+					if ep, err := audio.ResolveUSBPCM(usbPath); err == nil {
+						return ep, nil
+					}
+					return audio.ResolveSoleUSBPCM()
 				},
 				OpenPCM: func(ctx context.Context, endpoint audio.Endpoint) (media.PCM, error) {
 					return alsa.Open(ctx, endpoint)

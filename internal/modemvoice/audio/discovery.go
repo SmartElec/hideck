@@ -21,6 +21,52 @@ func (e Endpoint) ALSADevice() string { return fmt.Sprintf("hw:%d,%d", e.Card, e
 
 var pcmNode = regexp.MustCompile(`^pcmC([0-9]+)D([0-9]+)([pc])$`)
 
+// usbDevicesRoot 是 sysfs 的 USB 设备树根，测试里可替换。
+var usbDevicesRoot = "/sys/bus/usb/devices"
+
+// ResolveSoleUSBPCM 在 USBPath 不可信时的兜底：整棵 USB 树上只有一个设备
+// 同时具备采集与播放 PCM 才认领。多声卡机器继续报错——认错卡会把通话音频
+// 串到别的设备上，比没有音频更难排查。
+func ResolveSoleUSBPCM() (Endpoint, error) {
+	entries, err := os.ReadDir(usbDevicesRoot)
+	if err != nil {
+		return Endpoint{}, fmt.Errorf("audio: read USB bus: %w", err)
+	}
+	pairs := make(map[Endpoint]uint8)
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.Contains(name, ":") {
+			// 接口目录由所属设备目录统一遍历，避免同一张卡算两遍。
+			continue
+		}
+		root, err := filepath.EvalSymlinks(filepath.Join(usbDevicesRoot, name))
+		if err != nil {
+			continue
+		}
+		ifaces, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, iface := range ifaces {
+			if !strings.HasPrefix(iface.Name(), name+":") {
+				continue
+			}
+			// 单个接口读不动（权限/竞态）不该让整轮发现失败。
+			_ = collectInterfacePCM(root, iface.Name(), pairs)
+		}
+	}
+	var found []Endpoint
+	for endpoint, directions := range pairs {
+		if directions == duplexDirections {
+			found = append(found, endpoint)
+		}
+	}
+	if len(found) != 1 {
+		return Endpoint{}, fmt.Errorf("audio: found %d bidirectional USB PCM devices; require exactly one", len(found))
+	}
+	return found[0], nil
+}
+
 const (
 	playbackDirection uint8 = 1 << iota
 	captureDirection
