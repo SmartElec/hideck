@@ -48,20 +48,35 @@ func (s *Session) control(ctx context.Context, id string, answer bool) (Update, 
 		return update, err
 	}
 	calls := s.voiceControlCalls()
-	if !containsCallID(calls, id) {
+	target, ok := trackedByID(calls, id)
+	if !ok {
 		return update, ErrCallChanged
 	}
-	if len(calls) != 1 || calls[0].Call.Mode != 0 || calls[0].Call.Multiparty {
-		return update, errors.New("modem voice: multiple calls require targeted control")
-	}
-	command := "AT+CHUP"
-	if answer {
-		if !calls[0].Call.Inbound || calls[0].Call.State != Incoming {
-			return update, errors.New("modem voice: call is not an incoming call")
-		}
-		command = "ATA"
+	// 呼叫等待时模组上会同时挂着两路语音通话，这里必须定向：AT+CHUP 会把
+	// 正在通话和等待中的一起断掉，用户只想挂断当前这一路。
+	command, err := controlCommand(target.Call, voiceCalls(calls), answer)
+	if err != nil {
+		return update, err
 	}
 	return s.execute(opCtx, command, update)
+}
+
+// trackedByID 在语音通话快照里按模组通话 ID 取回当前索引。
+func trackedByID(calls []TrackedCall, id string) (TrackedCall, bool) {
+	for _, call := range calls {
+		if id != "" && call.ID == id {
+			return call, true
+		}
+	}
+	return TrackedCall{}, false
+}
+
+func voiceCalls(calls []TrackedCall) []Call {
+	out := make([]Call, 0, len(calls))
+	for _, call := range calls {
+		out = append(out, call.Call)
+	}
+	return out
 }
 
 func (s *Session) voiceControlCalls() []TrackedCall {

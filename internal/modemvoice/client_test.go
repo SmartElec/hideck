@@ -61,7 +61,6 @@ func TestWholeModemControlRequiresSingleExpectedCall(t *testing.T) {
 	expected := Call{Index: 1, Inbound: true, State: Incoming, Number: "10010"}
 	for _, response := range []string{
 		"", "+CLCC: 1,1,4,0,0,\"10086\",129", "+CLCC: 1,1,4,0,1,\"10010\",129",
-		"+CLCC: 1,1,4,0,0,\"10010\",129\n+CLCC: 2,1,5,0,0",
 	} {
 		executor := &executorStub{response: response}
 		client, _ := NewClient(executor)
@@ -69,8 +68,19 @@ func TestWholeModemControlRequiresSingleExpectedCall(t *testing.T) {
 			t.Fatalf("unsafe voice hangup: %q %v", response, executor.commands)
 		}
 	}
-	executor := &executorStub{response: "+CLCC: 1,1,4,0,0,\"10010\",129"}
+	// 呼叫等待：模组上挂着 incoming + waiting 两路，整段 CHUP 会连等待的一起断，
+	// 所以只允许定向释放，命令落到索引上。
+	executor := &executorStub{response: "+CLCC: 1,1,4,0,0,\"10010\",129\n+CLCC: 2,1,5,0,0"}
 	client, _ := NewClient(executor)
+	if err := client.Hangup(context.Background(), expected); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(executor.commands, []string{"AT+CLCC", "AT+CHLD=11"}) {
+		t.Fatal(executor.commands)
+	}
+
+	executor = &executorStub{response: "+CLCC: 1,1,4,0,0,\"10010\",129"}
+	client, _ = NewClient(executor)
 	if err := client.Answer(context.Background(), expected); err != nil {
 		t.Fatal(err)
 	}
