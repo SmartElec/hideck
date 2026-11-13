@@ -308,7 +308,7 @@ func (s *Service) finishCall(event voicehost.CallEvent) {
 	s.mu.Unlock()
 	defer call.terminalOnce.Do(func() { close(call.terminalDone) })
 	s.stopMixedRecording(call)
-	if mediaID != "" {
+	if mediaID != "" && !s.mediaSharedByLiveCall(mediaID, event.CallID) {
 		s.media.Remove(mediaID)
 	}
 	s.mu.RLock()
@@ -319,6 +319,27 @@ func (s *Service) finishCall(event voicehost.CallEvent) {
 	if s.notifier != nil {
 		go s.notifier.NotifyCallResult(deviceID, peer, direction, status, event.Reason, endedAt)
 	}
+}
+
+// mediaSharedByLiveCall 判断是否还有别的在途通话挂在这路媒体上。呼叫等待时
+// 前后两通电话共用同一个 WebRTC 会话，谁先结束都不能把媒体拆掉：拆了以后剩下
+// 那通既听不到声音，也再没有可用的控制租约（后端只会回 invalid media control
+// lease）。
+func (s *Service) mediaSharedByLiveCall(mediaID, endedCallID string) bool {
+	if mediaID == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for callID, call := range s.calls {
+		if callID == endedCallID || call == nil || call.terminal {
+			continue
+		}
+		if call.mediaID == mediaID {
+			return true
+		}
+	}
+	return false
 }
 
 func terminalStatus(call *activeCall, event voicehost.CallEvent) string {
