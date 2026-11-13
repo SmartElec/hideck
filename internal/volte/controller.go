@@ -636,6 +636,7 @@ func (c *Controller) refreshATRegistration(ctx context.Context, deviceID string)
 		// 串口偶发超时：保留上一次已知状态，别把已注册的 IMS 打回未注册。
 		return
 	}
+	wasRegistered := c.Status(deviceID).IMSRegistered
 	c.patch(deviceID, func(st *Status) {
 		st.LTERegistered = reg.LTERegistered
 		st.IMSPDNActive = reg.IMSPDN
@@ -649,6 +650,10 @@ func (c *Controller) refreshATRegistration(ctx context.Context, deviceID string)
 		}
 		st.Phase = PhaseRegistering
 	})
+	if reg.IMSRegistered && !wasRegistered {
+		logger.Info("VoLTE(AT) 注册就绪", "device", deviceID,
+			"lte", reg.LTERegistered, "ims_pdn", reg.IMSPDN)
+	}
 }
 
 func (c *Controller) ensureVoiceIndications(ctx context.Context, deviceID, reason string) error {
