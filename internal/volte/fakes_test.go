@@ -61,6 +61,12 @@ type FakeModem struct {
 	burstDTMFErr          error
 	startDTMFErr          error
 	stopDTMFErr           error
+	// QMICore 模拟设备是否具备 QMI 核心；false 时 QMI 接口一律按"没有 QMI"拒绝。
+	QMICore bool
+	// CIREGError 模拟不认 AT+CIREG? 的模组（EC20F 实测返回 ERROR）。
+	CIREGError bool
+	clcc       string
+	DialAT     string
 }
 
 func newFakeModem() *FakeModem {
@@ -80,6 +86,7 @@ func newFakeModem() *FakeModem {
 		},
 		UACImmediate: true,
 		Audio:        "",
+		QMICore:      true,
 		Reg:          Registration{Registered: true, VoiceAvailable: true},
 		COPS:         "46000",
 		CEREG:        1,
@@ -159,6 +166,15 @@ func (f *FakeModem) ExecuteAT(deviceID, cmd string, _ time.Duration) (string, er
 		return fmt.Sprintf("+COPS: 0,2,\"%s\",7\r\nOK\r\n", plmn), nil
 	case cmd == CEREGQueryCommand():
 		return fmt.Sprintf("+CEREG: 0,%d\r\nOK\r\n", f.CEREG), nil
+	case cmd == CIREGQueryCommand():
+		if f.CIREGError {
+			return "ERROR", nil
+		}
+		bit := 0
+		if f.IMS == 1 && (f.CEREG == 1 || f.CEREG == 5) {
+			bit = 1
+		}
+		return fmt.Sprintf("+CIREG: 1,%d\r\nOK\r\n", bit), nil
 	case cmd == CGDCONTQueryCommand():
 		return "+CGDCONT: 1,\"IP\",\"cmnet\"\r\n+CGDCONT: 2,\"IPV4V6\",\"ims\"\r\nOK\r\n", nil
 	case cmd == CGACTQueryCommand():
@@ -173,6 +189,24 @@ func (f *FakeModem) ExecuteAT(deviceID, cmd string, _ time.Duration) (string, er
 			f.imsActive = true
 		}
 		return "OK", nil
+	case cmd == "AT+CLCC":
+		if strings.TrimSpace(f.clcc) == "" {
+			return "OK\r\n", nil
+		}
+		return f.clcc + "\r\nOK\r\n", nil
+	case strings.HasPrefix(cmd, "ATD"):
+		f.DialAT = cmd
+		return "OK\r\n", nil
+	case cmd == "ATA":
+		return "OK\r\n", nil
+	case cmd == "AT+CHUP" || cmd == "ATH":
+		f.clcc = ""
+		return "OK\r\n", nil
+	case cmd == "AT+CHLD=2":
+		return "OK\r\n", nil
+	case strings.HasPrefix(cmd, "AT+VTS="):
+		f.dtmfActions = append(f.dtmfActions, cmd)
+		return "OK\r\n", nil
 	default:
 		return "OK", nil
 	}
@@ -265,14 +299,35 @@ func (f *FakeModem) ReleaseIMSClients(string) error {
 	f.ReleaseCount++
 	return nil
 }
+func (f *FakeModem) HasQMICore(string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.QMICore
+}
+
+// setCLCC 写入 AT+CLCC 的应答体（不含 OK 行）。
+func (f *FakeModem) setCLCC(lines ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clcc = strings.Join(lines, "\r\n")
+}
+
 func (f *FakeModem) SubscribeIMSRegistration(_ string, handler func(*qmi.IMSARegistrationStatus)) (func(), error) {
 	f.mu.Lock()
+	if !f.QMICore {
+		f.mu.Unlock()
+		return nil, fmt.Errorf("设备 %s 没有 QMI", f.ID)
+	}
 	f.imsRegHandler = handler
 	f.mu.Unlock()
 	return f.imsUnsubscribe(func() { f.imsRegHandler = nil }), nil
 }
 func (f *FakeModem) SubscribeIMSServices(_ string, handler func(*qmi.IMSAServicesStatus)) (func(), error) {
 	f.mu.Lock()
+	if !f.QMICore {
+		f.mu.Unlock()
+		return nil, fmt.Errorf("设备 %s 没有 QMI", f.ID)
+	}
 	f.imsSvcHandler = handler
 	f.mu.Unlock()
 	return f.imsUnsubscribe(func() { f.imsSvcHandler = nil }), nil

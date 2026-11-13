@@ -244,6 +244,9 @@ func (c *Controller) beginCall(ctx context.Context, request voicehost.BeginCallR
 	if c == nil || c.host == nil {
 		return voicehost.CallSnapshot{}, errors.New("volte: controller is not configured")
 	}
+	if c.atFallback(deviceID) {
+		return c.atBeginCall(ctx, deviceID, request.Callee, request.SDP)
+	}
 	st := c.Status(deviceID)
 	if !st.IMSRegistered {
 		return voicehost.CallSnapshot{}, errors.New("volte: native IMS is not registered")
@@ -325,6 +328,9 @@ func (c *Controller) ActiveCall(deviceID string) *voicehost.CallSnapshot {
 }
 
 func (c *Controller) HangupCall(ctx context.Context, deviceID, id string) error {
+	if c.atFallback(deviceID) {
+		return c.atHangup(ctx, strings.TrimSpace(deviceID), id)
+	}
 	call, ok := c.lookup(deviceID, id)
 	if !ok {
 		return nil
@@ -342,6 +348,12 @@ func (c *Controller) HangupCall(ctx context.Context, deviceID, id string) error 
 }
 
 func (c *Controller) AnswerIncomingCall(ctx context.Context, request voicehost.AnswerRequest) (voicehost.AnswerResult, error) {
+	if c.atFallback(request.DeviceID) {
+		if err := c.atAnswer(ctx, strings.TrimSpace(request.DeviceID), request.CallID); err != nil {
+			return voicehost.AnswerResult{}, err
+		}
+		return voicehost.AnswerResult{CallID: request.CallID, State: "connected"}, nil
+	}
 	call, ok := c.lookup(request.DeviceID, request.CallID)
 	if !ok {
 		return voicehost.AnswerResult{}, fmt.Errorf("volte: call %s not found", request.CallID)
@@ -359,6 +371,9 @@ func (c *Controller) AnswerIncomingCall(ctx context.Context, request voicehost.A
 }
 
 func (c *Controller) RejectIncomingCall(request voicehost.RejectRequest) error {
+	if c.atFallback(request.DeviceID) {
+		return c.atHangup(context.Background(), strings.TrimSpace(request.DeviceID), request.CallID)
+	}
 	call, ok := c.lookup(request.DeviceID, request.CallID)
 	if !ok {
 		return nil
@@ -460,6 +475,13 @@ func (c *Controller) setNativeHold(ctx context.Context, deviceID, id string, hol
 	if !hold {
 		fallback = qmi.VoiceSupsLocalUnhold
 	}
+	if c.atFallback(deviceID) {
+		if err := c.atSetHold(ctx, strings.TrimSpace(deviceID), id, hold); err != nil {
+			return err
+		}
+		call.Held = hold
+		return nil
+	}
 	err := c.host.VOICEManageCalls(ctx, deviceID, qmi.VoiceManageCallsRequest{
 		ServiceType: primary, CallID: call.QMI,
 	})
@@ -519,6 +541,7 @@ func (c *Controller) DeviceStatus(deviceID string) map[string]interface{} {
 		"reboot_required":         st.RebootRequired,
 		"provision_stage":         st.ProvisionStage,
 		"qmi_ims_unavailable":     st.QMIIMSUnavailable,
+		"at_fallback":             st.ATFallback,
 		"plmn":                    st.PLMN,
 		"mbn_name":                st.MBNName,
 		"lte_registered":          st.LTERegistered,

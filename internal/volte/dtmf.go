@@ -23,6 +23,10 @@ func (c *Controller) SendCallDTMF(deviceID, id, digit string) error {
 		return errors.New("volte: DTMF must be one of 0-9, * or #")
 	}
 	deviceID = strings.TrimSpace(deviceID)
+	if c.atFallback(deviceID) {
+		// 降级链路没有 QMI VOICE，DTMF 走 AT+VTS。
+		return c.atSendDTMF(context.Background(), deviceID, id, digit)
+	}
 	// Drain the complete tone before retiring or handing off its device session.
 	return c.withDevice(deviceID, func() error {
 		call, ok := c.lookup(deviceID, id)

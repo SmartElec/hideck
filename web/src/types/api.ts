@@ -48,6 +48,7 @@ export type NativeVoLTEStatus = {
   audio_device?: string
   reboot_required?: boolean
   qmi_ims_unavailable?: boolean
+  at_fallback?: boolean
   provision_stage?: string
   imei_tail?: string
   plmn?: string

@@ -28,13 +28,16 @@ type Controller struct {
 }
 
 type session struct {
-	events          sync.Mutex
-	voiceEnsure     sync.Mutex
-	gen             uint64
-	imsHooked       bool
-	imsUnsubscribe  []func()
-	status          Status
-	voice           *voiceSession
+	events         sync.Mutex
+	voiceEnsure    sync.Mutex
+	gen            uint64
+	imsHooked      bool
+	imsUnsubscribe []func()
+	status         Status
+	voice          *voiceSession
+	// atVoice 只在模块没有 QMI、原生 VoLTE 降级到 AT 时存在。
+	atVoice         *atVoice
+	atRefreshAt     time.Time
 	alsaUnavailable bool
 	lastVoiceAt     time.Time
 	qpcmvTried      bool
@@ -155,9 +158,18 @@ func (c *Controller) EnableChecked(ctx context.Context, request EnableRequest) e
 			}
 		})
 		if err := c.attachIMS(deviceID, gen); err != nil {
+			if c.atFallback(deviceID) {
+				// AT 降级没有 QMI IMSA 可订阅，注册状态由 CEREG 轮询维持。
+				c.waitIMS(ctx, deviceID)
+				return nil
+			}
 			return c.fail(deviceID, err)
 		}
 		if err := c.attachVoice(deviceID); err != nil {
+			if c.atFallback(deviceID) {
+				c.waitIMS(ctx, deviceID)
+				return nil
+			}
 			c.patch(deviceID, func(st *Status) { st.VoiceIndicationsReady = false })
 			return c.fail(deviceID, err)
 		}
@@ -195,6 +207,8 @@ func (c *Controller) Disable(deviceID string) {
 				_ = m.Close()
 			}
 		}
+		// AT 降级的 CLCC 轮询必须先停，否则会话销毁后它还会继续打 AT。
+		c.stopATVoice(deviceID)
 		c.mu.Lock()
 		var unsubscribe []func()
 		if s := c.sess[deviceID]; s != nil {
@@ -293,6 +307,18 @@ func (c *Controller) provisionConfig(ctx context.Context, deviceID string) error
 	}
 	if err := c.host.EnsureIMSClients(ctx, deviceID); err != nil {
 		logger.Warn("QMI IMS/IMSA 客户端不可用", "device", deviceID, "err", err)
+		// 设备本来就没有 QMI（ECM/RNDIS 下没有 cdc-wdm0，或 QMI 服务栈故障）时，
+		// 不该把整条 VoLTE 判死：模块自己会注册 IMS，AT 一样能通话。降级成功后
+		// PDN/IMS/Voice 由 AT 探测结果填充，UI 才会放行拨号。
+		if !c.qmiAvailable(deviceID) {
+			if fallbackErr := c.enableATFallback(ctx, deviceID, err); fallbackErr != nil {
+				c.patch(deviceID, func(st *Status) { st.QMIIMSUnavailable = true })
+				return c.fail(deviceID, fallbackErr)
+			}
+			c.syncAudioStatus(deviceID, res.Current.UACEnabled)
+			c.ensureVoicePCM(deviceID)
+			return nil
+		}
 		c.patch(deviceID, func(st *Status) { st.QMIIMSUnavailable = true })
 		return c.fail(deviceID, err)
 	}
@@ -555,6 +581,10 @@ func applyIMSARegistration(st *Status, info *qmi.IMSARegistrationStatus) bool {
 }
 
 func (c *Controller) refreshRegistration(ctx context.Context, deviceID string) {
+	if c.atFallback(deviceID) {
+		c.refreshATRegistration(ctx, deviceID)
+		return
+	}
 	reg, err := c.host.IMSAStatus(ctx, deviceID)
 	c.patch(deviceID, func(st *Status) {
 		if err != nil {
@@ -580,7 +610,53 @@ func (c *Controller) refreshRegistration(ctx context.Context, deviceID string) {
 	})
 }
 
+// refreshATRegistration 是 AT 降级下的注册判定。模块自己完成 IMS 注册，
+// 主机只能通过 CEREG/CIREG 间接确认。waitIMS 会 200ms 轮询一次，串口承受不住，
+// 这里按 atRefreshInterval 限流。
+func (c *Controller) refreshATRegistration(ctx context.Context, deviceID string) {
+	if ctx != nil && ctx.Err() != nil {
+		return
+	}
+	c.mu.Lock()
+	s := c.sess[deviceID]
+	if s == nil {
+		c.mu.Unlock()
+		return
+	}
+	now := time.Now()
+	if now.Sub(s.atRefreshAt) < atRefreshInterval {
+		c.mu.Unlock()
+		return
+	}
+	s.atRefreshAt = now
+	c.mu.Unlock()
+
+	reg := c.atCheckRegistration(deviceID)
+	if !reg.Known {
+		// 串口偶发超时：保留上一次已知状态，别把已注册的 IMS 打回未注册。
+		return
+	}
+	c.patch(deviceID, func(st *Status) {
+		st.LTERegistered = reg.LTERegistered
+		st.IMSPDNActive = reg.IMSPDN
+		st.IMSRegistered = reg.IMSRegistered
+		st.VoiceAvailable = reg.IMSRegistered
+		st.VoiceIndicationsReady = reg.IMSRegistered
+		if reg.IMSRegistered {
+			st.Phase = PhaseRegistered
+			st.LastError = ""
+			return
+		}
+		st.Phase = PhaseRegistering
+	})
+}
+
 func (c *Controller) ensureVoiceIndications(ctx context.Context, deviceID, reason string) error {
+	// AT 降级下没有 QMI VOICE 指示可订阅，语音就绪由 CEREG 决定。
+	if c.atFallback(deviceID) {
+		c.refreshATRegistration(ctx, deviceID)
+		return nil
+	}
 	c.mu.Lock()
 	s := c.sess[deviceID]
 	if s == nil {

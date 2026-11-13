@@ -76,6 +76,35 @@ func ParseCEREG(resp string) (LTEState, error) {
 	return LTEState{}, fmt.Errorf("volte: missing +CEREG in %q", compactAT(resp))
 }
 
+// ParseCIREG 解析 AT+CIREG? 的 "+CIREG: <n>,<reg_info>"。reg_info 是位图，
+// bit0 表示模块自身 IMS 已注册（EC2x 系列）；只有 1 个参数时按 reg_info 处理。
+func ParseCIREG(resp string) (bool, error) {
+	for _, raw := range strings.Split(resp, "\n") {
+		line := strings.TrimSpace(raw)
+		if !strings.HasPrefix(strings.ToUpper(line), "+CIREG:") {
+			continue
+		}
+		_, rest, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		parts := splitQCFGArgs(rest)
+		idx := 0
+		if len(parts) > 1 {
+			idx = 1
+		}
+		if idx >= len(parts) {
+			break
+		}
+		info, err := strconv.Atoi(parts[idx])
+		if err != nil {
+			return false, fmt.Errorf("volte: CIREG reg_info: %w", err)
+		}
+		return info&1 == 1, nil
+	}
+	return false, fmt.Errorf("volte: missing +CIREG in %q", compactAT(resp))
+}
+
 func ParseCGDCONT(resp string) ([]PDPContext, error) {
 	var out []PDPContext
 	for _, raw := range strings.Split(resp, "\n") {
@@ -155,6 +184,7 @@ func parseCGDCONTArgs(rest string) (cid, pdp, apn string, ok bool) {
 func COPSQueryCommand() string         { return "AT+COPS?" }
 func COPSNumericFormatCommand() string { return "AT+COPS=3,2" }
 func CEREGQueryCommand() string        { return "AT+CEREG?" }
+func CIREGQueryCommand() string        { return "AT+CIREG?" }
 func CGDCONTQueryCommand() string      { return "AT+CGDCONT?" }
 func CGACTQueryCommand() string        { return "AT+CGACT?" }
 

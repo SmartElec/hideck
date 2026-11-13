@@ -17,6 +17,21 @@ func TestParseCOPSAndCEREG(t *testing.T) {
 	}
 }
 
+func TestParseCIREG(t *testing.T) {
+	registered, err := ParseCIREG("+CIREG: 0,1\r\nOK")
+	if err != nil || !registered {
+		t.Fatalf("registered=%v err=%v", registered, err)
+	}
+	notRegistered, err := ParseCIREG("+CIREG: 1,0\r\nOK")
+	if err != nil || notRegistered {
+		t.Fatalf("notRegistered=%v err=%v", notRegistered, err)
+	}
+	// EC20F 这类不支持的模组只回 ERROR，调用方据此退化成看 ims PDN。
+	if _, err := ParseCIREG("ERROR"); err == nil {
+		t.Fatal("ERROR 必须报错，不能被当成未注册")
+	}
+}
+
 func TestParseIMSContext(t *testing.T) {
 	ctxs, err := ParseCGDCONT(`+CGDCONT: 1,"IP","cmnet","0.0.0.0",0,0
 +CGDCONT: 2,"IPV4V6","ims","0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0",0,0

@@ -196,6 +196,13 @@ func (p *Pool) stopSoftwareIMS(deviceID string, restoreRadio bool) error {
 	return p.voWiFiHost().Disable(p.Context(), deviceID, "native_volte", restoreRadio)
 }
 
+// HasQMICore 供 VoLTE 控制器判断是否具备 QMI 能力。设备只用 AT 后端
+// （ECM/RNDIS 下没有 cdc-wdm0）时返回 false，控制器据此走 AT 降级而不是判死。
+func (p *Pool) HasQMICore(deviceID string) bool {
+	w := p.GetWorker(strings.TrimSpace(deviceID))
+	return w != nil && w.QMICore != nil
+}
+
 func (p *Pool) SetNativeIMS(ctx context.Context, deviceID string, enabled bool) error {
 	w := p.GetWorker(deviceID)
 	if w == nil || w.QMICore == nil {
