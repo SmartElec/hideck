@@ -18,6 +18,34 @@ func TestCLCCStatesAndInternationalNumber(t *testing.T) {
 	}
 }
 
+func TestCLCCSkipsURCMixedIntoResponse(t *testing.T) {
+	// 串口共享：通话期间 RING / NO CARRIER / +QIND 会串进 CLCC 的响应体。
+	// 以前这类混杂会让整次查询失败，挂电话时提示 "unexpected CLCC response line"。
+	response := "AT+CLCC\r\n+CLCC: 1,0,0,0,0,\"10000\",129\r\nRING\r\n" +
+		"+QIND: \"act\",1\r\n+CREG: 0,1\r\nOK"
+	calls, err := ParseCLCC(response)
+	if err != nil {
+		t.Fatalf("mixed URC should not fail parsing: %v", err)
+	}
+	if len(calls) != 1 || calls[0].Number != "10000" {
+		t.Fatalf("calls = %+v", calls)
+	}
+}
+
+func TestCLCCFailsWhenResponseHasNoCallLine(t *testing.T) {
+	// 只有 URC 没有 +CLCC: 行，说明这次响应不可信；必须返回错误，
+	// 否则空列表会被上层当成"通话已结束"。
+	for _, response := range []string{
+		"RING\r\n+QIND: \"act\",1\r\nOK",
+		"NO CARRIER\r\nOK",
+		"garbage line\r\nOK",
+	} {
+		if calls, err := ParseCLCC(response); err == nil {
+			t.Fatalf("accepted %q as an empty snapshot: %+v", response, calls)
+		}
+	}
+}
+
 func TestCLCCRejectsPartialOrFailedSnapshot(t *testing.T) {
 	for _, response := range []string{
 		"ERROR", "+CME ERROR: 3", "NO CARRIER", "+CLCC: 1,1,0",
