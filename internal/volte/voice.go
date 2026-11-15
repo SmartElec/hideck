@@ -799,17 +799,21 @@ func audioError(st Status) string {
 	if st.UACUnusable {
 		return "模组 USB 声卡不可用，VoLTE 可打但没有模组音频"
 	}
-	if st.QPCMVFailed {
-		return "模组无法把通话 PCM 接到 USB 声卡（QPCMV 失败），能打通但没有声音"
-	}
 	if st.ATFallback {
 		// AT 降级不查 QCFG 的 UAC 开关：通话音频直接走模组 UAC 声卡（主机 ALSA），
 		// 声卡探测到就能录。这里若还按 uac_enabled 判定，会把正常通话误报成
 		// "需要 UAC，模组可能要重启后才有声卡"。
+		//
+		// QPCMV 同理：部分固件（USB 描述符报成 Android 的 EC25 就是）直接回
+		// ERROR，但语音默认就走 UAC，录音完全正常。声卡在就不再提 QPCMV，
+		// 否则每通电话都会被记成"能打通但没有声音"。
 		if strings.TrimSpace(st.AudioDevice) != "" {
 			return ""
 		}
 		return "未检测到模组声卡，本次通话没有录音"
+	}
+	if st.QPCMVFailed {
+		return "模组无法把通话 PCM 接到 USB 声卡（QPCMV 失败），能打通但没有声音"
 	}
 	if strings.TrimSpace(st.AudioDevice) != "" && st.UACEnabled && !st.RebootRequired {
 		return ""
