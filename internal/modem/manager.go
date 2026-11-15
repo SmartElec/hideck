@@ -147,6 +147,10 @@ type Manager struct {
 	voiceURCMu   sync.Mutex
 	voiceURCSubs map[chan struct{}]struct{}
 
+	// 网络注册状态订阅（+CREG / +CGREG / +CEREG）
+	regMu       sync.RWMutex
+	regHandlers []func(domain string, stat int)
+
 	// APDU 仲裁（设备级全局）
 	apduArbiter  *apduarbiter.Arbiter
 	apduLeaseMu  sync.Mutex
@@ -1378,6 +1382,41 @@ func (m *Manager) dispatchRDY() {
 	}
 }
 
+// OnRegistrationChange 订阅网络注册状态变化（+CREG / +CGREG / +CEREG）。
+//
+// stat 语义按 3GPP 27.007：1=本地注册、5=漫游注册、2=未注册但正在附着、
+// 0=未注册且未尝试附着、3=注册被拒绝。调用方只在 stat 表示"已注册"时
+// 采取动作即可，其余状态交给上层判断。返回的取消函数可重复调用。
+func (m *Manager) OnRegistrationChange(handler func(domain string, stat int)) func() {
+	if m == nil || handler == nil {
+		return func() {}
+	}
+	m.regMu.Lock()
+	m.regHandlers = append(m.regHandlers, handler)
+	index := len(m.regHandlers) - 1
+	m.regMu.Unlock()
+	return func() {
+		m.regMu.Lock()
+		if index < len(m.regHandlers) {
+			m.regHandlers[index] = nil
+		}
+		m.regMu.Unlock()
+	}
+}
+
+// dispatchRegistration 内部调用：把注册状态变化分发给订阅者。
+// 异步执行，避免某个订阅者阻塞 AT 读取循环。
+func (m *Manager) dispatchRegistration(domain string, stat int) {
+	m.regMu.RLock()
+	handlers := append([]func(string, int){}, m.regHandlers...)
+	m.regMu.RUnlock()
+	for _, handler := range handlers {
+		if handler != nil {
+			go handler(domain, stat)
+		}
+	}
+}
+
 func (m *Manager) dispatchSIMStatusURC(inserted *bool, state string) {
 	m.infoMu.RLock()
 	handler := m.simStatusHandler
@@ -1423,6 +1462,21 @@ func (m *Manager) handleURC(line string) {
 			}
 		}
 		m.dispatchSIMStatusURC(nil, state)
+	}
+
+	// 分发网络注册状态变化（+CREG / +CGREG / +CEREG）。VoLTE 靠它感知
+	// "掉网后重新驻上 LTE"，否则启动时读到 CEREG=2 就永久停在 failed。
+	if fr.Key == "+CREG" || fr.Key == "+CGREG" || fr.Key == "+CEREG" {
+		stat := -1
+		for i := 0; i+1 < len(fr.Fields); i += 2 {
+			if k, _ := fr.Fields[i].(string); k == "stat" {
+				stat, _ = fr.Fields[i+1].(int)
+				break
+			}
+		}
+		if stat >= 0 {
+			m.dispatchRegistration(strings.TrimPrefix(fr.Key, "+"), stat)
+		}
 	}
 
 	if fr.Key == "+QSIMSTAT" {

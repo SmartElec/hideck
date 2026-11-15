@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
@@ -42,6 +43,10 @@ type session struct {
 	lastVoiceAt     time.Time
 	qpcmvTried      bool
 	qpcmvOK         bool
+	// regRetrying 保证"注册恢复后重新拉起 VoLTE"同一时刻只有一个在跑。
+	regRetrying atomic.Bool
+	// regUnsubscribe 取消 AT 注册状态订阅，每次 Enable 重建。
+	regUnsubscribe func()
 }
 
 const voiceUSBQuiet = 20 * time.Second
@@ -134,7 +139,27 @@ func (c *Controller) EnableChecked(ctx context.Context, request EnableRequest) e
 		gen := s.gen
 		s.status.Phase = PhaseEnabling
 		s.status.LastError = ""
+		// 注册订阅必须在 waitLTE 之前建立：附着超时会让这次 Enable 直接失败，
+		// 而那正是最需要"注册恢复后自动重试"的场景。
+		if s.regUnsubscribe != nil {
+			s.regUnsubscribe()
+			s.regUnsubscribe = nil
+		}
 		c.mu.Unlock()
+		cancel, err := c.host.SubscribeRegistration(deviceID, c.registrationHandler(deviceID, s, gen))
+		if err != nil {
+			logger.Warn("订阅网络注册状态失败，掉网后无法自动恢复", "device", deviceID, "err", err)
+		} else {
+			c.mu.Lock()
+			if c.sess[deviceID] == s && s.gen == gen {
+				s.regUnsubscribe = cancel
+				cancel = nil
+			}
+			c.mu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+		}
 
 		if err := c.host.StopSoftwareIMS(deviceID); err != nil {
 			return c.fail(deviceID, fmt.Errorf("stop software IMS: %w", err))
@@ -223,6 +248,10 @@ func (c *Controller) dropSession(deviceID string) {
 		s.gen++
 		unsubscribe = append(unsubscribe, s.imsUnsubscribe...)
 		s.imsUnsubscribe = nil
+		if s.regUnsubscribe != nil {
+			unsubscribe = append(unsubscribe, s.regUnsubscribe)
+			s.regUnsubscribe = nil
+		}
 		if s.voice != nil {
 			unsubscribe = append(unsubscribe, s.voice.unsubscribe)
 			s.voice.unsubscribe = nil
@@ -501,6 +530,45 @@ func (c *Controller) attachIMS(deviceID string, gen uint64) error {
 	s.imsUnsubscribe = []func(){cancelRegistration, cancelServices}
 	c.mu.Unlock()
 	return nil
+}
+
+// registrationHandler 处理 AT 层的网络注册状态变化（+CREG / +CGREG / +CEREG）。
+//
+// 典型故障：模组冷启动或掉网重连时 CEREG 还停在 2（正在附着），waitLTE 等满
+// 后就把 phase 置为 failed，之后即使 LTE 早就注册成功也没有任何路径回来——
+// 页面一直显示"失败"，通话不但没声音，连 IMS 都不会重新发起注册。这里在收到
+// "已注册"的 URC 时补跑一次完整的 Enable，让状态自己恢复。
+//
+// 只在 phase == failed 时动手：registered / ims_enabled_unverified 这些状态
+// 要么已经在正常通话，要么只是缺注册确认，重启流程只会打断它们。
+func (c *Controller) registrationHandler(deviceID string, s *session, gen uint64) func(domain string, stat int) {
+	return func(domain string, stat int) {
+		// 27.007：1=已注册(本地)，5=已注册(漫游)，2=正在附着，3=被拒绝，0=未注册。
+		if stat != 1 && stat != 5 {
+			return
+		}
+		if s == nil || !c.sessionGenerationLive(deviceID, s, gen) {
+			return
+		}
+		if c.Status(deviceID).Phase != PhaseFailed {
+			return
+		}
+		if !s.regRetrying.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			defer s.regRetrying.Store(false)
+			if s == nil || !c.sessionGenerationLive(deviceID, s, gen) {
+				return
+			}
+			logger.Info("检测到 LTE 已注册，重新拉起原生 VoLTE", "device", deviceID, "domain", domain, "stat", stat)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if err := c.Enable(ctx, deviceID); err != nil {
+				logger.Warn("LTE 恢复后重新启用 VoLTE 失败", "device", deviceID, "err", err)
+			}
+		}()
+	}
 }
 
 func (c *Controller) imsRegistrationHandler(deviceID string, s *session, gen uint64) func(*qmi.IMSARegistrationStatus) {

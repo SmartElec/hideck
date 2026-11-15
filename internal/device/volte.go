@@ -379,6 +379,21 @@ func (p *Pool) VOICEStopContinuousDTMF(ctx context.Context, deviceID string, cal
 	return err
 }
 
+// SubscribeRegistration 订阅 AT 层的网络注册状态变化（+CREG / +CGREG / +CEREG）。
+//
+// 只有 AT 后端有这份 URC；QMI 后端（以及非 AT 设备）返回空订阅而不是错误，
+// 让调用方不必按后端类型分支。
+func (p *Pool) SubscribeRegistration(deviceID string, handler func(domain string, stat int)) (func(), error) {
+	if p == nil || handler == nil {
+		return func() {}, nil
+	}
+	w := p.GetWorker(deviceID)
+	if w == nil || w.Modem == nil {
+		return func() {}, nil
+	}
+	return w.Modem.OnRegistrationChange(handler), nil
+}
+
 func (p *Pool) SubscribeVoiceStatus(deviceID string, handler func(*qmi.VoiceAllCallInfo)) (func(), error) {
 	w := p.GetWorker(deviceID)
 	if w == nil || w.QMICore == nil {

@@ -44,6 +44,7 @@ type FakeModem struct {
 	imsSvcHandler         func(*qmi.IMSAServicesStatus)
 	IMSUnsubscribeCount   int
 	voiceHandler          func(*qmi.VoiceAllCallInfo)
+	regHandler            func(domain string, stat int)
 	allCalls              *qmi.VoiceAllCallInfo
 	Reg                   Registration
 	RegErr                error
@@ -413,6 +414,30 @@ func (f *FakeModem) VOICEStopContinuousDTMF(_ context.Context, _ string, callID 
 	f.dtmfActions = append(f.dtmfActions, fmt.Sprintf("stop:%d", callID))
 	return f.stopDTMFErr
 }
+func (f *FakeModem) SubscribeRegistration(_ string, handler func(domain string, stat int)) (func(), error) {
+	f.mu.Lock()
+	f.regHandler = handler
+	f.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			f.mu.Lock()
+			f.regHandler = nil
+			f.mu.Unlock()
+		})
+	}, nil
+}
+
+// fireRegistration 模拟一次网络注册状态 URC。
+func (f *FakeModem) fireRegistration(domain string, stat int) {
+	f.mu.Lock()
+	handler := f.regHandler
+	f.mu.Unlock()
+	if handler != nil {
+		handler(domain, stat)
+	}
+}
+
 func (f *FakeModem) SubscribeVoiceStatus(_ string, handler func(*qmi.VoiceAllCallInfo)) (func(), error) {
 	f.mu.Lock()
 	if f.VoiceSubscribeErr != nil {

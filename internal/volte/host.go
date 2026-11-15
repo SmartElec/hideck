@@ -42,4 +42,7 @@ type Host interface {
 	VOICEStopContinuousDTMF(ctx context.Context, deviceID string, callID uint8) error
 	VOICEGetAllCallInfo(ctx context.Context, deviceID string) (*qmi.VoiceAllCallInfo, error)
 	SubscribeVoiceStatus(deviceID string, handler func(*qmi.VoiceAllCallInfo)) (func(), error)
+	// SubscribeRegistration 订阅网络注册状态变化（AT 后端的 CREG/CGREG/CEREG）。
+	// 没有该能力的后端返回空订阅与 nil 错误。
+	SubscribeRegistration(deviceID string, handler func(domain string, stat int)) (func(), error)
 }

@@ -160,6 +160,38 @@ func TestVoiceAgentMOSequenceOnce(t *testing.T) {
 	}
 }
 
+func TestVoiceRecoversWhenRegistrationArrivesAfterFailure(t *testing.T) {
+	host := newFakeModem()
+	host.IMS, host.VoLTE = 1, 1
+	host.USB[len(host.USB)-1] = "1"
+	// 冷启动时模组还在附着（CEREG=2），Enable 会因等不到 LTE 而失败。
+	host.CEREG = 2
+	ctl := NewControllerWithBackup(host, t.TempDir())
+	ctl.lteWait = 0
+	ctl.imsWait = 0
+	if err := ctl.Enable(context.Background(), "wwan1"); err == nil {
+		t.Fatal("enable should fail while LTE is not registered")
+	}
+	if phase := ctl.Status("wwan1").Phase; phase != PhaseFailed {
+		t.Fatalf("phase = %s, want %s", phase, PhaseFailed)
+	}
+
+	// 网络随后注册成功：AT 层会推 +CEREG URC，VoLTE 必须自己爬起来。
+	host.mu.Lock()
+	host.CEREG = 1
+	host.mu.Unlock()
+	host.fireRegistration("CEREG", 1)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ctl.Status("wwan1").Phase != PhaseFailed {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("phase still %s after registration recovered", ctl.Status("wwan1").Phase)
+}
+
 func TestVoiceAnsweredCallEmitsCallFinalized(t *testing.T) {
 	ctl, host := enableVoice(t)
 	var events []voicehost.CallEvent
