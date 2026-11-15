@@ -34,6 +34,7 @@ type PhoneState = {
 }
 
 let clockTimer: number | null = null
+let deviceTimer: number | null = null
 let mediaController: PhoneMediaController | null = null
 let eventListener: PhoneEventListener | null = null
 
@@ -103,6 +104,25 @@ export const usePhoneStore = defineStore('phone', {
       }
       this.startEventStream()
       this.startClock()
+      this.startDeviceRefresh()
+    },
+
+    // 设备侧的状态（VoLTE 注册、模组重连、声卡就绪）由后端异步变化，通话
+    // 事件流不会推送，只能定时拉一次：否则页面要手动刷新才看得到"已注册"。
+    startDeviceRefresh() {
+      if (deviceTimer !== null) return
+      deviceTimer = window.setInterval(() => {
+        if (document.visibilityState !== 'visible') return
+        void this.syncDevices()
+      }, 10_000)
+    },
+
+    async syncDevices() {
+      try {
+        this.devices = await phoneService.devices()
+      } catch {
+        // 轮询失败不打断页面，等下一轮
+      }
     },
 
     dispose() {
@@ -111,6 +131,8 @@ export const usePhoneStore = defineStore('phone', {
       eventListener = null
       if (clockTimer !== null) window.clearInterval(clockTimer)
       clockTimer = null
+      if (deviceTimer !== null) window.clearInterval(deviceTimer)
+      deviceTimer = null
       mediaController?.close()
       mediaController = null
       this.mediaState = 'idle'
